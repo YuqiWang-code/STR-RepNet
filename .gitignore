@@ -1,0 +1,8 @@
+# checkpoint
+*.pth
+*.pt
+checkpoints/
+
+# python
+__pycache__/
+*.pyc
