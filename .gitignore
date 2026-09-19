@@ -1,8 +1,17 @@
-# checkpoint
+# checkpoint / pretrained weight (上传到 GitHub Releases，不进 git)
 *.pth
 *.pt
 checkpoints/
+pretrained_weight/
 
 # python
 __pycache__/
 *.pyc
+*.pyo
+
+# 本地配置 / 密钥 / 工具脚本
+.vscode/
+.claude/
+
+# 训练输出 / 日志
+outputs/
