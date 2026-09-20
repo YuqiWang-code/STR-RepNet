@@ -1,565 +1,116 @@
-# 轻量化遥感二值变化检测中的重参数化研究方案调研与最终方向
+# 轻量遥感二值变化检测中的结构重参数化研究方案
+
+> 更新：2026-09-19。Baseline 已定为 HAM-CD；研究重心从「重新设计 decoder」收敛为
+> 「对 HAM-CD 的中间模块与解码器做结构重参数化改造」，并保留一条备选路线：
+> 「加载预训练权重前提下对编码器做多分支推理→单分支折叠」。
 
 ## 1. 研究目标
 
-任务：全监督遥感双时相二值变化检测（LEVIR-CD-256、SYSU-CD-256、WHU-CD-256、CDD-CD-256）。
+- 任务：全监督遥感双时相二值变化检测，四个公共数据集
+  CDD-CD-256 / LEVIR-CD-256 / SYSU-CD-256 / WHU-CD-256（A/B/label + list，label 阈值 gray≥128）。
+- 目标：推理参数量与 FLOPs 保持极低、推理实时友好；
+  **训练期**用多分支/异构结构增强表达，**部署期**折叠为单路径（结构重参数化），
+  且部署前后主预测误差 < 1e-6。
+- 硬约束：创新集中在 **decoder / 时相融合 / 中间模块 / 残差桥接 / 边界监督**，不重构 backbone；
+  encoder 保持成熟预训练网络（VMamba/VSSM-Tiny）。
+
+## 2. Baseline：HAM-CD
+
+论文：*HAM-CD: Hybrid Attention Mamba for Remote Sensing Change Detection*，IEEE TGRS 2026（已录用发表）。
+代码 `models/changedetection/`，模型入口 `models/changedetection/models/MambaBCD.py`（`STMambaBCD`）。
+
+### 2.1 基线结构
+
+- **Encoder**：权重共享 Siamese，VMamba（VSSM-Tiny，预训练 `vssm_tiny_0230_ckpt_epoch_262.pth`），
+  4 级下采样，输出 4 级多尺度特征 `{F1..F4}`（`EMBED_DIM 96 / DEPTHS [2,2,4,2] / SSM_FORWARDTYPE v3noz`）。
+- **Decoder**：4 级 HAM 解码器，每级 = HAM block（+ 第 2–4 级含 ICSF 跨级融合）→ ×2 上采样。
+- **参数量 36.08 M，FLOPs 16.26 G**（双时相 2×3×256×256，eval 模式，fvcore 实测）。
+- 损失：`CE + 2.0 × Lovász-Softmax`；优化器 AdamW(lr=1e-4, wd=5e-4)，300 epoch，batch 16。
+
+### 2.2 关键模块（= 重参数化改造对象）
+
+| 模块 | 作用 | 内部结构（对应代码） |
+|---|---|---|
+| HAM block | 全局+局部空间-时相建模 | 并行 TAM + TAB，`fuse_layer`（1×1 conv）融合 |
+| TAM（Textual-aware Mamba） | 局部像素依赖 + SSM 长程 | 3×3 DWConv（替代 1D 因果卷积）+ TASF 三路膨胀卷积（dilation 1/3/5）+ S6 选择性扫描 |
+| TAB / MDTA（`Attention`） | 全局依赖（通道维转置注意力） | `qkv` 1×1 conv + `qkv_dwconv` 3×3 DWConv（无偏置）+ `project_out` 1×1 + 跨通道协方差注意力 |
+| ICSF（`ICSFBlock`/`D_ICSFBlock`） | 跨级时相特征融合 | 3×3 Conv+BN+ReLU → 3×3 DWConv+BN；CFEM=SE 式通道注意力（GAP→1×1→ReLU→1×1→Sigmoid）；SFEM=3×3 DWConv；残差 |
+| FeedForward（门控 FFN） | 通道建模 | `project_in` 1×1 → 门控 3×3 DWConv → `project_out` 1×1 |
+| SS2D（编码器） | 多方向交叉扫描 | 4 方向扫描 + 选择性扫描（输入依赖） |
+
+### 2.3 为什么不选其它 baseline
+
+- 早期 SCAM / ST-Mamba / ChangeMamba 均已在 Mamba-CD 方向上密集被做，创新空间有限；
+  HAM-CD 是 2026 TGRS 最新 SOTA，且其 decoder/中间模块大量使用**卷积型多分支结构**，
+  天然适合结构重参数化改造，同时编码器带官方预训练权重，满足「轻量 + 强 + 可发表 + 可实现」。
+
+## 3. 研究路线：对哪些模块做结构重参数化
+
+### 3.1 主攻方向 A：中间模块重参数化
+
+针对 HAM block 内部的卷积型多分支做「训练多分支 → 部署单路径」折叠：
+
+- **TAM 局部分支**：3×3 DWConv + 三路膨胀卷积（dilation 1/3/5）是典型多分支卷积，
+  可按 ACNet / DBB 膨胀卷积折叠思路合并为单个等效大核；SSM 选择性扫描本身是输入依赖递归，**不可折叠**，部署保留轻量 SSM。
+- **TAB / MDTA**：`qkv` 1×1 + `qkv_dwconv` 3×3 是 RepVGG 式「1×1+3×3→3×3」结构，可直接折叠；
+  `project_out` 1×1 与后续融合层可进一步合并。
+- **FFN**：门控 3×3 DWConv 可与相邻 1×1 折叠。
+- 目标：训练期多分支增强表达，部署期每个 HAM block 折叠为「1×1 Conv → DW RepKernel → 轻量 SSM → 1×1 Conv」。
+
+### 3.2 主攻方向 B：解码器 / 跨级融合重参数化
+
+- **ICSF**：`3×3 Conv+BN+ReLU` 与 `3×3 DWConv+BN` 可 BN-fold + 多分支卷积折叠为单个 3×3；
+  CFEM 的 SE 通道注意力是**空间全局 + 数据依赖**的门控，不能静态折叠为卷积，
+  部署时保留为极低成本的通道尺度（或与后续 1×1 合并）。
+- **HAM 并行分支融合**：`fuse_layer`（concat → 1×1）与 TAM/TAB 输出卷积可折叠；
+  训练期 TAM、TAB 并行（参考论文 Table V：并行优于串行），部署期融合为单路径。
+- **时相拓扑重参数化（Temporal Rep）**：训练期 Concat / Sum / Diff 三路
+  `Y = Conv([X1,X2]) + Conv(X1+X2) + Conv(X2−X1)`，部署期由卷积线性性折叠为单个 1×1：
+  `W_deploy = [Wc + Ws − Wd, Wc + Ws + Wd]`。
+
+### 3.3 备选方向 C：编码器多分支推理 → 单分支折叠（加载预训练权重）
+
+- 目标：在**加载官方预训练权重**的前提下，把编码器推理时的多方向交叉扫描（SS2D 4 方向）/
+  多分支结构折叠/简化为更少分支或单分支，且不重训 backbone、不破坏预训练表示。
+- 难点（需调研确认）：SS2D 的选择性扫描参数是输入依赖的（data-dependent），
+  与 RepVGG 式「静态卷积可加性折叠」不同，多方向扫描结果不能直接相加等价，
+  需调研是否存在「扫描方向剪枝 / 子方向蒸馏 / 秩约减 / 卷积化近似」等 2024–2026 相关工作。
+
+## 4. 重参数化技术储备（待调研补全）
+
+- **经典**：RepVGG（3×3+1×1+Identity→3×3）、ACNet（非对称核）、
+  DBB（Diverse Branch Block，多尺度/多核/多拓扑折叠）、RepLKNet（大核 DWConv 重参数化）、
+  OREPA（在线重参数化，缩减训练成本）、RepGhost / RepViT（轻量 backbone）。
+- **用于本课题**：膨胀卷积多分支折叠（TAM 三路 dilation）、BN-fold + 卷积合并（ICSF/ResBlock）、
+  时相拓扑线性折叠（Temporal Rep）、大核重参数化（RepLK 风格，服务建筑边界/大感受野）。
+- **已有遥感 CD 先例**：CD-RLKNet（大核重参数化用于变化检测）等，需系统调研 2024–2026 后继工作。
+
+## 5. 关键难点与可证伪判据
+
+1. **可折叠性边界**：卷积型多分支可折叠；SSM 递归、SE/通道注意力（全局数据依赖门控）不可静态折叠，
+   只能保留为部署期极低成本组件。任何「把不可折叠结构强行折叠」的声称都要证伪。
+2. **部署一致性**：重参数化折叠前后主预测误差必须 < 1e-6（已列为硬约束）。
+3. **预训练权重兼容**：encoder 折叠不得破坏 VSSM-Tiny 预训练表示（备选方向 C 的核心判据）。
+4. **不堆模块**：每项改动要有机制动机 + 与既有工作实质区别 + 最小消融 + 失败判据，
+   不把调参包装成创新；单数据集单种子微小差异不称普适提升。
+
+## 6. 预期贡献（草案，随调研收敛）
+
+1. 提出双时相拓扑重参数化（Temporal Rep：Concat/Sum/Diff 三路 → 单 1×1）。
+2. 提出面向 Mamba 混合注意力解码器的多分支卷积重参数化（Rep-HAM：TAM/TAB/ICSF/FFN 折叠）。
+3. 提出「训练复杂、部署单路径」的轻量变化检测网络，保持极低部署参数量/FLOPs。
+4. （备选）预训练权重下编码器多方向扫描的推理期分支合并。
+
+## 7. 实验设计
+
+- **Baseline**：HAM-CD 原模型（4 数据集，Run1 协议）。
+- **Ablation（唯一变量）**：① baseline → ② +Temporal Rep → ③ +Spatial/多分支折叠（中间模块）
+  → ④ +ICSF 融合折叠 → ⑤ +Boundary/边界监督 → ⑥ Full。
+- 每项报告：Rec/Prec/OA/F1/IoU/Kappa + 训练参数量 vs 部署参数量 + FLOPs + 折叠前后误差。
+- 成功阈值：在 ≥2 个数据集、多 seed 上稳定超过 baseline，且部署 FLOPs/参数不增反降。
 
-目标：
+## 8. 下一步（当前）
 
--   参数量保持极低；
--   推理保持实时友好；
--   通过训练阶段多分支增强表达能力；
--   通过结构重参数化在部署阶段折叠为单路径。
-
-当前实验平台： - RTX 5090 ×2； - 四个数据集统一采用 A/B/label 格式； -
-mask 阈值统一为 gray \>=128。
-
-数据规范来自项目环境文档：四个数据集分别为
-CDD、LEVIR、SYSU、WHU，并已经完成 split 审计；DataLoader 使用 A/B/label
-和 list 文件规范。fileciteturn0file1L40-L57
-
-------------------------------------------------------------------------
-
-# 2. Baseline 选择
-
-## 2.1 不建议继续使用纯 MobileNetV2 baseline
-
-原因：
-
-MobileNetV2 + 简单 decoder 已经大量使用，创新空间主要集中在 decoder。
-
-如果目标是 2025-2026 论文级工作，需要一个更新、更强的 encoder-decoder
-框架。
-
-------------------------------------------------------------------------
-
-# 2.2 推荐 Baseline
-
-## Baseline-A：SCAM（2025 JSTARS）
-
-论文：
-
-Scan Channel Attention Mamba-Based Network for Remote Sensing Change
-Detection
-
-优势：
-
-1.  2025 IEEE JSTARS；
-2.  使用 Mamba 建模长程依赖；
-3.  在 LEVIR-CD、WHU-CD、SYSU-CD 等公开数据集验证；
-4.  包含轻量 CNN decoder。
-
-SCAM 报告在： - LEVIR-CD F1=91.01% - WHU-CD F1=93.14% - SYSU-CD
-F1=83.60%
-
-其结构适合作为改造对象： - encoder 保留 Mamba/CNN 特征提取； - decoder
-替换为 Rep-Mamba Hybrid Decoder。
-
-------------------------------------------------------------------------
-
-## Baseline-B：ST-Mamba
-
-2025 TGRS：
-
-Spatio-Temporal Mamba for Remote Sensing Change Detection
-
-特点：
-
--   专门处理双时相关系；
--   强调时空联合建模；
--   适合加入 temporal re-parameterization。
-
-缺点：
-
-Mamba模块较重，不适合极低参数目标。
-
-------------------------------------------------------------------------
-
-## Baseline-C：轻量 CNN baseline
-
-如果最终目标 \<5M 参数：
-
-推荐：
-
-MobileNetV3 / EfficientNet-Lite / LWGANet 作为 encoder。
-
-原因：
-
-遥感变化检测中 decoder 和 fusion 往往比 backbone 更决定性能。
-
-------------------------------------------------------------------------
-
-# 最终推荐
-
-采用：
-
-## SCAM-lite + Rep-Temporal-Spatial Decoder
-
-理由：
-
--   新；
--   有Mamba全局建模；
--   decoder存在重构空间；
--   不重复 ChangeMamba；
--   可以形成"轻量Mamba + 结构重参数化"的独立贡献。
-
-------------------------------------------------------------------------
-
-# 3. 重参数化技术调研
-
-## 3.1 RepVGG思想
-
-核心：
-
-训练：
-
-多分支：
-
-3×3 Conv + 1×1 Conv + Identity
-
-推理：
-
-融合：
-
-单个3×3 Conv。
-
-意义：
-
-解决训练表达能力和部署效率之间矛盾。
-
-------------------------------------------------------------------------
-
-# 3.2 DBB
-
-Diverse Branch Block
-
-CVPR 2021。
-
-虽然早于要求年份，但是2024-2026相关工作大量继承其思想。
-
-核心：
-
-训练：
-
--   大核；
--   小核；
--   非对称卷积；
--   pooling；
-
-推理：
-
-融合成一个卷积。
-
-迁移：
-
-适合变化检测 decoder。
-
-------------------------------------------------------------------------
-
-# 3.3 RepLKNet思想
-
-核心：
-
-大核卷积重参数化。
-
-训练：
-
-多个小卷积辅助学习。
-
-部署：
-
-大核DWConv。
-
-遥感变化检测优势：
-
--   建筑变化需要大感受野；
--   道路、建筑边缘需要方向信息。
-
-已有变化检测工作 CD-RLKNet 将大核重参数化用于遥感变化检测。
-
-------------------------------------------------------------------------
-
-# 3.4 Rep-Mamba Hybrid Block
-
-建议作为本文核心。
-
-设计：
-
-训练阶段：
-
-                 Feature
-                    |
-          -----------------------
-          |          |          |
-       RepConv   Diff Branch   Mamba
-          |          |          |
-          -----------------------
-                    |
-              Fusion
-
-三个分支：
-
-## Branch A：Local RepConv
-
-作用：
-
--   边界；
--   小目标；
--   高频纹理。
-
-## Branch C：Difference Branch
-
-输入：
-
-\|F1-F2\|
-
-作用：
-
-直接强化变化区域。
-
-## Branch B：Lightweight Mamba
-
-作用：
-
--   长程一致性；
--   大范围变化。
-
-部署：
-
-A+C：
-
-折叠。
-
-B：
-
-保留一个轻量SSM。
-
-最终：
-
-    Input
-
-     ↓
-
-    1×1 Conv
-
-     ↓
-
-    DW RepKernel
-
-     ↓
-
-    Light Mamba
-
-     ↓
-
-    Output
-
-------------------------------------------------------------------------
-
-# 4. 时空结构重参数化方案
-
-参考已有设计：
-
-## Temporal Rep
-
-输入：
-
-X1,X2
-
-训练：
-
-三个信息流：
-
-1.  Concat
-
-Yc = Conv(\[X1,X2\])
-
-2.  Sum
-
-Ys = Conv(X1+X2)
-
-3.  Diff
-
-Yd = Conv(X2-X1)
-
-融合：
-
-Y=Yc+Ys+Yd
-
-部署：
-
-折叠：
-
-Wdeploy=
-
-Wc+\[Ws-Wd, Ws+Wd\]
-
-因此：
-
-三路时相拓扑
-
-↓
-
-一个1×1 Conv。
-
-------------------------------------------------------------------------
-
-## Spatial Rep
-
-训练：
-
-    DW5×5
-    DW3×3
-    Dilated DW3×3
-    DW1×5
-    DW5×1
-    Identity
-
-部署：
-
-统一融合：
-
-DW5×5
-
-优势：
-
-同时获得：
-
--   大尺度上下文；
--   局部边界；
--   方向结构。
-
-------------------------------------------------------------------------
-
-# 5. 不建议直接使用 RepViT
-
-RepViT（CVPR 2024）：
-
-优势：
-
--   CNN+ViT思想；
--   移动端友好。
-
-但是：
-
-对于变化检测：
-
-问题：
-
-1.  backbone已经不是瓶颈；
-2.  双时相交互需要专门设计；
-3.  替换encoder创新风险大。
-
-因此：
-
-不作为第一选择。
-
-------------------------------------------------------------------------
-
-# 6. 最终唯一研究方向
-
-## 名称：
-
-Rep-Mamba Spatio-Temporal Re-parameterized Decoder for Lightweight
-Remote Sensing Change Detection
-
-中文：
-
-轻量遥感变化检测的时空重参数化Mamba解码网络
-
-------------------------------------------------------------------------
-
-# 7. 网络结构
-
-## Encoder
-
-采用：
-
-SCAM-lite / MobileNetV3 / EfficientNet-lite
-
-输出：
-
-E1-E5。
-
-------------------------------------------------------------------------
-
-## Decoder核心
-
-每一级decoder加入：
-
-## STR-Mamba Block
-
-Spatial-Temporal Re-parameterized Mamba Block
-
-训练：
-
-            Bi-temporal Features
-
-                  |
-           Temporal Rep
-        /      |        \
-    Concat   Sum      Diff
-
-                  |
-           Spatial Rep
-     /  /  /  /  /  /
-    5x5 3x3 Dil AC Id
-
-                  |
-
-          Lightweight Mamba
-
-                  |
-
-            Decoder Output
-
-部署：
-
-    Concat
-
-     |
-
-    1×1 Conv
-
-     |
-
-    DW5×5
-
-     |
-
-    Mamba
-
-     |
-
-    1×1 Conv
-
-------------------------------------------------------------------------
-
-# 8. Boundary增强
-
-训练阶段：
-
-使用GT生成boundary：
-
-Boundary = Dilate(mask)-Erode(mask)
-
-增加：
-
-Boundary Auxiliary Loss
-
-Loss:
-
-L=
-
-BCE
-
--   
-
-Dice
-
--   
-
-λ Boundary Loss
-
-作用：
-
-提高：
-
--   建筑边缘；
--   小变化；
--   细长目标。
-
-------------------------------------------------------------------------
-
-# 9. 实验设计
-
-必须包含：
-
-## Baseline
-
-原模型。
-
-## Ablation
-
-1.  
-
-baseline
-
-2.  
-
-+Temporal Rep
-
-3.  
-
-+Spatial Rep
-
-4.  
-
-+Mamba
-
-5.  
-
-+Boundary supervision
-
-6.  
-
-Full
-
-------------------------------------------------------------------------
-
-# 10. 预期贡献
-
-贡献1：
-
-提出双时相拓扑重参数化。
-
-贡献2：
-
-提出空间异构卷积重参数化decoder。
-
-贡献3：
-
-提出Rep-Mamba Hybrid Block。
-
-贡献4：
-
-实现训练复杂、部署简单的轻量变化检测网络。
-
-------------------------------------------------------------------------
-
-# 11. 最终建议
-
-不要重构 backbone。
-
-重点：
-
-Encoder保持成熟预训练网络。
-
-创新全部集中：
-
--   decoder；
--   temporal fusion；
--   residual bridge；
--   boundary branch。
-
-最终路线：
-
-SCAM-lite encoder
-
--   
-
-Temporal Rep
-
--   
-
-Spatial RepLK
-
--   
-
-Lightweight Mamba
-
--   
-
-Boundary supervision
-
-这是当前最符合： "轻量化 + SOTA + 可发表 + 可实现" 的方向。
+对 §3 三条路线的相关文献做**详尽调研**（范围见 `ChatGPT_Project_Settings.md` §30：
+2024–2026，CCF-A 会议 + IEEE TGRS/ISPRS JPRS/JSTARS/TIP 等权威期刊，可核验引用），
+据此收敛唯一主方案与对照，再进入设计→实现→实验循环。

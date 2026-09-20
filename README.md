@@ -11,6 +11,7 @@ git push origin main
 
 - 预训练权重 `pretrained_weight/*.pth` 不进 git，更新时上传到 GitHub Releases
   （仓库页 → Releases → Draft a new release → 上传附件 `.pth`）。
+- `docs/参考文献/` 的调研 PDF 与 `文献索引.md` 随 `docs/` 一并提交（`.gitignore` 未忽略 PDF）。
 
 ---
 
@@ -37,6 +38,13 @@ Lightweight Spatial-Temporal Structural Re-parameterization Network for Remote S
 - 优化器：`AdamW(lr=1e-4, weight_decay=5e-4)`，300 epoch，batch 16
 - **参数量 36.08 M，FLOPs 16.26 G**（双时相 2×3×256×256，eval 模式，fvcore 实测）
 
+## 参考文献
+
+调研文献按 [`docs/temporary/过去的想法/STR-RepNet_结构重参数化_2024-2026文献调研与创新空白.md`](docs/temporary/过去的想法/STR-RepNet_结构重参数化_2024-2026文献调研与创新空白.md)
+的分类整理，索引见 [`docs/参考文献/文献索引.md`](docs/参考文献/文献索引.md)。
+索引内按「题名 / 年份 / venue / 层级（CCF-A 或 SCI）/ 一作+机构 / 官方链接 / 相关子方向 / Top-15 优先精读」登记每篇文献，
+据此可直接定位到 `docs/参考文献/` 下的 PDF。
+
 ## 目录结构
 
 ```
@@ -52,6 +60,13 @@ models/                    # 全部代码（已从 HAM-CD 源码整理、适配�
   kernels/selective_scan/  # 自定义 CUDA 内核（已适配 sm_120 + CUDA 13）
 train_scripts/baseline/Run1/  # 4 个数据集的服务器启动脚本
 outputs/baseline/Run1/        # 训练日志（训练结束后下载到这里，每数据集一个文件夹）
+docs/                         # 项目文档
+  temporary/                  # 研究方案与调研文档
+  参考文献/                    # 调研文献 PDF（索引见 文献索引.md）
+    baseline/                 # HAM-CD 基线论文
+    2024-2026主证据/          # 调研文档 §16.1
+    预印本与辅助证据/          # 调研文档 §16.2
+    经典理论锚点/              # 调研文档 §16.3
 ```
 
 ## 服务器环境（RSML-3）
