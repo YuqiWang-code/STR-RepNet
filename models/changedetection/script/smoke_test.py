@@ -1,4 +1,5 @@
-"""Smoke test for the HAM-CD baseline pipeline (model build + forward + params/FLOPs + dataloader)."""
+"""Smoke test for STR-RepNet Clean TAR-DCR (build + forward + params/FLOPs + deploy + dataloader)."""
+import copy
 import os
 import sys
 import argparse
@@ -11,14 +12,14 @@ if _MODELS_ROOT not in sys.path:
     sys.path.insert(0, _MODELS_ROOT)
 
 from changedetection.configs.config import get_config
-from changedetection.models.MambaBCD import STMambaBCD
+from changedetection.models.STRRepNet import STRRepNet
 from changedetection.datasets.make_data_loader import ChangeDetectionDataset, read_list
 
 
 def build_model(args, config):
     v = config.MODEL.VSSM
-    return STMambaBCD(
-        pretrained=args.pretrained_weight_path,
+    return STRRepNet(
+        pretrained=args.pretrained_weight_path, rep_mode=args.rep_mode,
         patch_size=v.PATCH_SIZE, in_chans=v.IN_CHANS, num_classes=config.MODEL.NUM_CLASSES,
         depths=v.DEPTHS, dims=v.EMBED_DIM,
         ssm_d_state=v.SSM_D_STATE, ssm_ratio=v.SSM_RATIO, ssm_rank_ratio=v.SSM_RANK_RATIO,
@@ -39,17 +40,29 @@ def main():
     ap.add_argument('--pretrained_weight_path', type=str, required=True)
     ap.add_argument('--dataset_root', type=str, required=True)
     ap.add_argument('--test_list', type=str, required=True)
+    ap.add_argument('--rep_mode', type=str, default='full', choices=['plain', 'tar', 'full'])
     ap.add_argument('--gpu', type=int, default=0)
     args = ap.parse_args()
 
     torch.cuda.set_device(args.gpu)
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    torch.backends.cudnn.deterministic = True
     config = get_config(args)
-    print("[1/4] building model ...")
-    model = build_model(args, config).cuda()
-    params = sum(p.numel() for p in model.parameters())
-    print(f"  params = {params/1e6:.3f} M")
 
-    print("[2/4] forward pass ...")
+    print("[1/5] building model ...")
+    model = build_model(args, config).cuda()
+    total = sum(p.numel() for p in model.parameters())
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"  total params = {total/1e6:.3f} M, trainable = {trainable/1e6:.3f} M")
+
+    # verify encoder frozen
+    enc_trainable = sum(p.numel() for p in model.encoder.parameters() if p.requires_grad)
+    model.train()
+    assert enc_trainable == 0 and model.encoder.training is False
+    print(f"  encoder frozen OK (trainable={enc_trainable}, training={model.encoder.training})")
+
+    print("[2/5] forward pass ...")
     model.eval()
     with torch.no_grad():
         pre = torch.randn(2, 3, 256, 256).cuda()
@@ -57,22 +70,31 @@ def main():
         out = model(pre, post)
     print(f"  output shape = {tuple(out.shape)} (expect (2, 2, 256, 256))")
 
-    print("[3/4] FLOPs ...")
+    print("[3/5] deploy fold ...")
+    deploy = copy.deepcopy(model)
+    deploy.switch_to_deploy()
+    deploy.eval()
+    with torch.no_grad():
+        out_d = deploy(pre, post)
+    err = (out - out_d).abs().max().item()
+    deploy_params = sum(p.numel() for p in deploy.parameters())
+    print(f"  fold max_abs_error = {err:.3e}, deploy params = {deploy_params/1e6:.3f} M")
+    assert err < 1e-4, f"fold error too large: {err}"
+
+    print("[4/5] FLOPs ...")
     from fvcore.nn import flop_count
     from classification.models.vmamba import selective_scan_flop_jit
-    from changedetection.models.utils import selective_scan_state_flop_jit
     supported = {
         "prim::PythonOp.SelectiveScanMamba": selective_scan_flop_jit,
         "prim::PythonOp.SelectiveScanOflex": selective_scan_flop_jit,
         "prim::PythonOp.SelectiveScanCore": selective_scan_flop_jit,
-        "prim::PythonOp.SelectiveScanStateFn": selective_scan_state_flop_jit,
     }
     with torch.no_grad():
-        counts, unsup = flop_count(model, (pre, post), supported_ops=supported)
-    total = sum(counts.values())
-    print(f"  FLOPs = {total:.4f} G  (unsupported={len(unsup)})")
+        counts, unsup = flop_count(deploy, (pre, post), supported_ops=supported)
+    total_flops = sum(counts.values())
+    print(f"  deploy FLOPs = {total_flops:.4f} G  (unsupported={len(unsup)})")
 
-    print("[4/4] dataloader ...")
+    print("[5/5] dataloader ...")
     ds = ChangeDetectionDataset(args.dataset_root, read_list(args.test_list), 256, type='test')
     a, b, l, name = ds[0]
     print(f"  sample: A {a.shape} {a.dtype}, B {b.shape}, label {l.shape} {l.dtype}, name {name}")

@@ -1,9 +1,8 @@
-"""Train the HAM-CD baseline (VSSM-Tiny encoder + Hybrid-Attention-Mamba decoder)
-for binary remote-sensing change detection on the A/B/label + list dataset format.
+"""Train STR-RepNet (Clean TAR-DCR) for binary remote-sensing change detection.
 
-Logs every epoch as one line (losses + 6 metrics), measures Params (M) and
-FLOPs (G), saves `last.pth` (resume) and `best_F1=xxx.pth` (test), and appends
-a final test block at the end of the training log.
+Frozen VMamba-Tiny Siamese encoder + TAR temporal bridge + DCR decoder.
+Logs every epoch as one line (losses + 6 metrics), saves `last.pth` (resume) and
+`best_F1=xxx.pth` (test), and appends a final deploy test block at the end.
 """
 import os
 import sys
@@ -25,7 +24,7 @@ from changedetection.configs.config import get_config
 from changedetection.datasets.make_data_loader import ChangeDetectionDataset, read_list
 from changedetection.utils_func.metrics import Evaluator
 from changedetection.utils_func import lovasz_loss as L
-from changedetection.models.MambaBCD import STMambaBCD
+from changedetection.models.STRRepNet import STRRepNet
 
 
 # -----------------------------------------------------------------------------
@@ -39,13 +38,11 @@ def measure_flops(model, size=256):
     """Return (total_flops, n_unsupported) for a (1,3,size,size) bi-temporal pair."""
     from fvcore.nn import flop_count
     from classification.models.vmamba import selective_scan_flop_jit
-    from changedetection.models.utils import selective_scan_state_flop_jit
 
     supported_ops = {
         "prim::PythonOp.SelectiveScanMamba": selective_scan_flop_jit,
         "prim::PythonOp.SelectiveScanOflex": selective_scan_flop_jit,
         "prim::PythonOp.SelectiveScanCore": selective_scan_flop_jit,
-        "prim::PythonOp.SelectiveScanStateFn": selective_scan_state_flop_jit,
     }
     model.eval()
     pre = torch.randn(1, 3, size, size).cuda()
@@ -54,6 +51,10 @@ def measure_flops(model, size=256):
         counts, unsupported = flop_count(model, (pre, post), supported_ops=supported_ops)
     total = sum(counts.values())
     return total, len(unsupported)
+
+
+def measure_trainable_params(model):
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 
 def fmt_flops(total):
@@ -80,8 +81,9 @@ class Trainer(object):
         self.model = self._build_model(config)
         self.model = self.model.cuda()
 
+        trainable_params = [p for p in self.model.parameters() if p.requires_grad]
         self.optimizer = optim.AdamW(
-            self.model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay
+            trainable_params, lr=args.learning_rate, weight_decay=args.weight_decay
         )
 
         self.train_list = read_list(args.train_list)
@@ -102,8 +104,9 @@ class Trainer(object):
 
     def _build_model(self, config):
         v = config.MODEL.VSSM
-        model = STMambaBCD(
+        model = STRRepNet(
             pretrained=self.args.pretrained_weight_path,
+            rep_mode=self.args.rep_mode,
             patch_size=v.PATCH_SIZE,
             in_chans=v.IN_CHANS,
             num_classes=config.MODEL.NUM_CLASSES,
@@ -240,7 +243,9 @@ class Trainer(object):
         self.log(f"[BEST] F1={self.best_f1:.4f} at epoch {self.best_epoch}")
 
     def test_best(self):
-        """Final test with the best checkpoint; appends inference params/FLOPs + metrics."""
+        """Final test with the best checkpoint on the deploy graph."""
+        import copy
+
         best_path = os.path.join(self.args.ckpt_dir, f"best_F1={self.best_f1:.4f}.pth")
         if not os.path.isfile(best_path):
             self.log("[TEST] best checkpoint not found, skipping final test")
@@ -249,16 +254,43 @@ class Trainer(object):
         self.model.load_state_dict(torch.load(best_path, map_location="cpu", weights_only=False))
         self.model = self.model.cuda()
 
-        params = measure_params(self.model)
-        flops, n_unsup = measure_flops(self.model, size=self.args.crop_size)
+        # disable TF32 to isolate the FP32 re-parameterization fold error
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+        torch.backends.cudnn.deterministic = True
+
+        self.model.eval()
+        ref_pre = torch.randn(1, 3, self.args.crop_size, self.args.crop_size).cuda()
+        ref_post = torch.randn(1, 3, self.args.crop_size, self.args.crop_size).cuda()
+        with torch.no_grad():
+            ref_logits = self.model(ref_pre, ref_post)
+
+        deploy_model = copy.deepcopy(self.model)
+        deploy_model.switch_to_deploy()
+        deploy_model.eval()
+        with torch.no_grad():
+            dep_logits = deploy_model(ref_pre, ref_post)
+        reparam_err = (ref_logits - dep_logits).abs().max().item()
+
+        train_total = measure_params(self.model)
+        trainable = measure_trainable_params(self.model)
+        deploy_params = measure_params(deploy_model)
+        deploy_flops, n_unsup = measure_flops(deploy_model, size=self.args.crop_size)
 
         test_loader = self._make_loader(self.args.test_list, self.args.test_batch_size, False, False)
+        saved_model = self.model
+        self.model = deploy_model
         rec, pre_, oa, f1, iou, kc = self._evaluate(test_loader)
+        self.model = saved_model
 
         self.log("=== TEST RESULTS ===")
-        self.log(f"[PARAMS] {fmt_params(params)} M")
-        self.log(f"[FLOPS]  {fmt_flops(flops)} G   (input 2x3x{self.args.crop_size}x{self.args.crop_size}, "
-                 f"unsupported_ops={n_unsup})")
+        self.log("[MODEL] STR-RepNet Clean TAR-DCR")
+        self.log(f"[REP-MODE] {self.args.rep_mode}")
+        self.log(f"[TOTAL-TRAIN-GRAPH-PARAMS] {fmt_params(train_total)} M")
+        self.log(f"[TRAINABLE-PARAMS] {fmt_params(trainable)} M")
+        self.log(f"[DEPLOY-PARAMS] {fmt_params(deploy_params)} M")
+        self.log(f"[DEPLOY-FLOPS] {fmt_flops(deploy_flops)} G   (unsupported_ops={n_unsup})")
+        self.log(f"[REPARAM-MAX-ABS-ERROR] {reparam_err:.3e}")
         self.log(f"Recall={rec:.4f} | Precision={pre_:.4f} | OA={oa:.4f} | F1={f1:.4f} | IoU={iou:.4f} | Kappa={kc:.4f}")
         self.log(f"[BEST-F1] {self.best_f1:.4f} (epoch {self.best_epoch})")
         self.log("=== END TEST RESULTS ===")
@@ -269,7 +301,7 @@ class Trainer(object):
 # -----------------------------------------------------------------------------
 def write_header(args, config, log):
     log("=" * 72)
-    log("HAM-CD Baseline  |  STR-RepNet / baseline / Run1")
+    log("STR-RepNet Clean TAR-DCR  |  train_scripts/TAR-DCR/Run1")
     log("=" * 72)
     log("[CONFIG]")
     for k, v in vars(args).items():
@@ -296,6 +328,7 @@ def main():
     parser.add_argument('--learning_rate', type=float, default=1e-4)
     parser.add_argument('--weight_decay', type=float, default=5e-4)
     parser.add_argument('--lovasz_weight', type=float, default=2.0)
+    parser.add_argument('--rep_mode', type=str, default='full', choices=['plain', 'tar', 'full'])
     parser.add_argument('--num_workers', type=int, default=8)
     parser.add_argument('--seed', type=int, default=2333)
     parser.add_argument('--resume', type=str, default=None)
@@ -314,7 +347,8 @@ def main():
 
     trainer = Trainer(args, config, log)
 
-    log("[PARAMS] " + fmt_params(measure_params(trainer.model)) + " M")
+    log("[TOTAL-TRAIN-GRAPH-PARAMS] " + fmt_params(measure_params(trainer.model)) + " M")
+    log("[TRAINABLE-PARAMS] " + fmt_params(measure_trainable_params(trainer.model)) + " M")
     flops, n_unsup = measure_flops(trainer.model, size=args.crop_size)
     log(f"[FLOPS]  {fmt_flops(flops)} G   (input 2x3x{args.crop_size}x{args.crop_size}, unsupported_ops={n_unsup})")
     log("=" * 72)

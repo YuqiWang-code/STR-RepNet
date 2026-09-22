@@ -24,19 +24,21 @@ Lightweight Spatial-Temporal Structural Re-parameterization Network for Remote S
 服务器与数据规范见
 [`docs/RSML-3_服务器环境与变化检测数据统一说明.md`](docs/RSML-3_服务器环境与变化检测数据统一说明.md)。
 
-## Baseline
+## 方法（STR-RepNet / Clean TAR-DCR）
 
-[HAM-CD: Hybrid Attention Mamba for Remote Sensing Change Detection](docs/参考文献/baseline/HAM-CD_Hybrid_Attention_Mamba_for_Remote_Sensing_Change_Detection.pdf)。
+- **Encoder**：Frozen VMamba-Tiny Siamese（不改结构、不参与训练；预训练权重 `vssm_tiny_0230_ckpt_epoch_262.pth`）
+- **TAR**（Temporal Algebraic Re-parameterization）：四级二时相 bridge，训练期 Concat + Sum + signed-Diff 三路 → 部署期折叠为单个 1×1
+- **DCR**（Decoder-wide Compositional Re-parameterization）：RepDW3 / RepPW1x1 / RepPairFuse1x1，整个 decoder 的可折叠算子图
 
-选用的基线结构 = **VSSM-Tiny 编码器**（VMamba，预训练权重 `vssm_tiny_0230_ckpt_epoch_262.pth`）
-+ **HAM-CD 混合注意力 Mamba 解码器**（`SpatialMambaBlock` SSM + MDTA 自注意力 + ICSF 通道注意力）。
+- 模型入口：`models/changedetection/models/STRRepNet.py`（`STRRepNet`）
+- 核心文件：`reparam.py`（代数折叠原语）、`tar.py`（二时相 bridge）、`dcr_decoder.py`（多尺度解码器）
+- `rep_mode`：`plain`（单路径对照）/ `tar`（时相 rep）/ `full`（全开）
+- 损失 `CE + 2.0 × Lovász-Softmax`；300 epoch，batch 16，seed 2333
+- 部署复杂度（不含 frozen encoder）：**中间+Decoder 约 0.84M 参数 / 0.92G FLOPs**；整网约 29.5M，可训练仅 1.56M
+- 折叠等价性：FP32 eval `max_abs_error ≈ 1.7e-5`（FP32 累加固有误差，argmax/F1 不变）
 
-- 模型定义：`models/changedetection/models/MambaBCD.py`（`STMambaBCD`）
-- 配置：`models/changedetection/configs/vssm1/vssm_tiny_224_0229flex.yaml`
-  （`EMBED_DIM 96 / DEPTHS [2,2,4,2] / SSM_FORWARDTYPE v3noz`）
-- 损失：`CE + 2.0 × Lovász-Softmax`
-- 优化器：`AdamW(lr=1e-4, weight_decay=5e-4)`，300 epoch，batch 16
-- **参数量 36.08 M，FLOPs 16.26 G**（双时相 2×3×256×256，eval 模式，fvcore 实测）
+> 旧 HAM-CD baseline 已归档在 git tag `baseline-hamcd-run1`
+> （WHU 0.9500 / LEVIR 0.9211 / CDD 0.9879 / SYSU ≈0.83）。
 
 ## 参考文献
 
@@ -48,25 +50,32 @@ Lightweight Spatial-Temporal Structural Re-parameterization Network for Remote S
 ## 目录结构
 
 ```
-models/                    # 全部代码（已从 HAM-CD 源码整理、适配）
-  changedetection/         # 变化检测主代码
-    configs/               # yacs 配置 + tiny yaml
-    datasets/              # DataLoader（A/B/label + list 格式）
-    models/                # 编码器 + 解码器 + 模型
-    script/train.py        # 训练入口（日志 + 参数量/FLOPs + last/best 保存）
-    script/smoke_test.py   # 冒烟测试
-    utils_func/            # metrics / lovasz / edge loss
-  classification/          # VMamba（VSSM）编码器实现
-  kernels/selective_scan/  # 自定义 CUDA 内核（已适配 sm_120 + CUDA 13）
-train_scripts/baseline/Run1/  # 4 个数据集的服务器启动脚本
-outputs/baseline/Run1/        # 训练日志（训练结束后下载到这里，每数据集一个文件夹）
-docs/                         # 项目文档
-  temporary/                  # 研究方案与调研文档
-  参考文献/                    # 调研文献 PDF（索引见 文献索引.md）
-    baseline/                 # HAM-CD 基线论文
-    2024-2026主证据/          # 调研文档 §16.1
-    预印本与辅助证据/          # 调研文档 §16.2
-    经典理论锚点/              # 调研文档 §16.3
+models/                        # 全部代码
+  changedetection/
+    configs/                   # yacs 配置 + tiny yaml
+    datasets/                  # DataLoader（A/B/label + list 格式）
+    models/                    # 6 个文件：
+      Mamba_backbone.py        #   Frozen VMamba-Tiny 编码器
+      reparam.py               #   代数折叠原语（RepDW3/RepPW1x1/RepPairFuse1x1）
+      tar.py                   #   TAR 二时相 bridge
+      dcr_decoder.py           #   DCR 多尺度解码器
+      STRRepNet.py             #   顶层网络（switch_to_deploy）
+      __init__.py
+    script/
+      train.py                 # 训练入口（rep_mode + 冻结 encoder + 部署测试）
+      smoke_test.py            # 冒烟测试
+      test_reparam_equivalence.py  # 折叠等价性测试
+    utils_func/                # metrics / lovasz / edge loss
+  classification/              # VMamba（VSSM）编码器实现
+  kernels/selective_scan/      # 自定义 CUDA 内核（已适配 sm_120 + CUDA 13）
+train_scripts/
+  baseline/Run1/               # HAM-CD baseline 启动脚本（历史，已归档）
+  TAR-DCR/Run1/                # TAR-DCR 启动脚本（A0_Plain / A1_TAR / A2_Full）
+analyse/                       # 分析工具
+  extract_metrics_to_excel.py  #   outputs → docs/experiment_metrics.xlsx
+  models_to_txt.py             #   models 代码快照 + 指标 → docs/temporary/*.txt
+outputs/                       # 训练日志（训练结束后下载到这里）
+docs/                          # 项目文档（temporary / 参考文献）
 ```
 
 ## 服务器环境（RSML-3）
@@ -99,24 +108,27 @@ docs/                         # 项目文档
 ## 训练 / 测试
 
 1. 本地改代码 → `python .claude/_deploy.py` 同步到服务器。
-2. 服务器启动（`nohup`，每脚本带断点续训重试循环）：
+2. 服务器启动（`nohup`，每脚本带断点续训重试循环），TAR-DCR 脚本在
+   `train_scripts/TAR-DCR/Run1/{A0_Plain,A1_TAR,A2_Full}/`：
    ```bash
-   cd /home/yqwang/projects/STR-RepNet/train_scripts/baseline/Run1
-   nohup bash train_WHU-CD-256.sh > /dev/null 2>&1 &
+   cd /home/yqwang/projects/STR-RepNet/train_scripts/TAR-DCR/Run1/A2_Full
+   nohup bash train_SYSU-CD-256.sh > /dev/null 2>&1 &
    ```
+   脚本内通过 `--rep_mode plain|tar|full` 控制消融版本。
 3. 训练日志格式：
-   - 开头：全部配置 + 参数量(M) + FLOPs(G)。
+   - 开头：全部配置 + 总参数量 + 可训练参数量 + FLOPs(G)。
    - 每个 epoch 一行：CE / Lovasz / Total 三个 loss + Recall / Precision / OA / F1 / IoU / Kappa 六项指标。
-   - 结尾：`=== TEST RESULTS ===` 推理参数量 + FLOPs + 六项指标。
-4. checkpoint：每数据集一个文件夹，只放 `last.pth`（断点续训）与
-   `best_F1=xxx.pth`（测试用）。
-5. 训练结束后只把 `train_log.txt` 下载回本地 `outputs/baseline/Run1/<dataset>/`。
+   - 结尾：`=== TEST RESULTS ===` 部署参数量 + 部署 FLOPs + 折叠误差 + 六项指标（用 deploy 图测试）。
+4. checkpoint：每 run 一个文件夹，只放 `last.pth`（断点续训）与 `best_F1=xxx.pth`（测试用）。
+5. 训练结束后把 `train_log.txt` 下载回本地 `outputs/`（`baseline/Run1/` 或 `TAR-DCR/Run1/`）。
 
-## 运行监控
+## 运行监控 / 分析
 
 ```bash
-python .claude/_monitor.py   # 查看 4 个数据集进度 + GPU 占用
-python .claude/_ssh.py '<cmd>'  # 通用 SSH 执行
+python .claude/_monitor.py              # 查看训练进度 + GPU 占用
+python .claude/_ssh.py '<cmd>'          # 通用 SSH 执行
+python analyse/extract_metrics_to_excel.py   # outputs → docs/experiment_metrics.xlsx
+python analyse/models_to_txt.py --tag TAR-DCR --run Run1  # models 快照 + 指标 → docs/temporary/
 ```
 
 ## 注意事项
