@@ -4,7 +4,7 @@
 
 ```bash
 cd f:/Code_Repositories_2/CursorCode/STR-RepNet
-git add models/ train_scripts/ docs/ README.md .gitignore
+git add models/ train_scripts/ analyse/ docs/ others/ README.md .gitignore
 git commit -m "update code"
 git push origin main
 ```
@@ -38,7 +38,55 @@ Lightweight Spatial-Temporal Structural Re-parameterization Network for Remote S
 - 折叠等价性：FP32 eval `max_abs_error ≈ 1.7e-5`（FP32 累加固有误差，argmax/F1 不变）
 
 > 旧 HAM-CD baseline 已归档在 git tag `baseline-hamcd-run1`
-> （WHU 0.9500 / LEVIR 0.9211 / CDD 0.9879 / SYSU ≈0.83）。
+> （WHU 0.9500 / LEVIR 0.9211 / CDD 0.9879 / SYSU 0.8299）。
+
+## 实验结果（Run1）
+
+### Full vs baseline（4 数据集）
+
+| 数据集 | HAM-CD baseline | TAR-DCR Full | ΔF1 |
+|---|---|---|---|
+| CDD | 0.9879 | 0.9768 | -1.11 |
+| WHU | 0.9500 | 0.9403 | -0.97 |
+| LEVIR | 0.9211 | 0.9033 | -1.78 |
+| SYSU | 0.8299 | 0.8124 | -1.75 |
+
+### 消融矩阵（4 数据集 × 3 模式）
+
+| 数据集 | Plain | TAR | Full |
+|---|---|---|---|
+| CDD | 0.9732 | 0.9735 | 0.9768 |
+| WHU | 0.9355 | 0.9388 | 0.9403 |
+| LEVIR | 0.9009 | 0.9003 | 0.9033 |
+| SYSU | 0.8114 | 0.8058 | 0.8124 |
+
+- 部署统一：**28.83M 参数（-20%）、12.61G FLOPs（-22%）、可训练 1.56M**。
+- 结论：DCR（decoder-wide 组合折叠）稳定正贡献（4 数据集 Full > Plain）；TAR（时相三路 rep）贡献微弱/为负；Full 整体比 HAM-CD baseline 低 1~2 点，换来 20% 复杂度下降。
+- 下一步候选：decoder 宽度 D=160→192（仍轻），或按设计文档 §82 的预案调整。
+
+## 实验结果（Run2：BN-FR + 公平性诊断）
+
+Run2 在 Run1 基础上做了两处改造（部署图/参数/FLOPs 完全不变）：
+- **BN-FR**：每个线性分支独立 BN + 可折叠 `α` 残差（替换 Run1 的共享 BN）；
+- **encoder 解冻诊断**：`frozen`（全冻结）/ `last2`（解冻 stage3+stage4）。
+
+| 变体 | LEVIR | SYSU |
+|---|---|---|
+| full_frozen（BN-FR，冻结） | 0.9094 | 0.8252 |
+| full_last2（BN-FR + 解冻后两级） | 0.9144 | 0.8345 |
+| dcr_frozen（BN-FR，仅 DCR） | 0.9090 | 0.8201 |
+
+对比（F1）：
+
+| 数据集 | Run1 Full | Run2 full_frozen | Run2 full_last2 | HAM-CD baseline |
+|---|---|---|---|---|
+| LEVIR | 0.9033 | 0.9094 | 0.9144 | 0.9211 |
+| SYSU | 0.8124 | 0.8252 | 0.8345 | 0.8299 |
+
+结论：
+- **BN-FR 有效（零部署增量）**：full_frozen 相对 Run1 Full 提升 LEVIR +0.61 / SYSU +1.28。
+- **冻结 encoder 是 Run1 落后 baseline 的主因**：解冻后两级再提升 +0.50 / +0.93，`full_last2` 在 SYSU 上反超 baseline（0.8345 > 0.8299）。
+- temporal aux 贡献：LEVIR 上很小（full≈dcr，+0.04），SYSU 上 +0.51。
 
 ## 参考文献
 

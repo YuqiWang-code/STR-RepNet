@@ -42,7 +42,7 @@ def block_tests(device):
     results = []
 
     x = torch.randn(2, C, H, W, device=device)
-    results.append(check_fold(RepDW3(C, include_identity=True, use_aux=True).to(device), (x,), name="RepDW3"))
+    results.append(check_fold(RepDW3(C, use_aux=True, use_residual=True).to(device), (x,), name="RepDW3"))
     results.append(check_fold(RepPW1x1(C, use_aux=True).to(device), (x,), name="RepPW1x1"))
     results.append(check_fold(RepLocalBlock(C, use_aux=True).to(device), (x,), name="RepLocalBlock"))
 

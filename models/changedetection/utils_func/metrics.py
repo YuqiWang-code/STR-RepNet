@@ -17,19 +17,19 @@ class Evaluator(object):
 
     def Pixel_Precision_Rate(self):
         assert self.confusion_matrix.shape[0] == 2
-        Pre = self.confusion_matrix[1, 1] / (self.confusion_matrix[0, 1] + self.confusion_matrix[1, 1])
+        Pre = self.confusion_matrix[1, 1] / (self.confusion_matrix[0, 1] + self.confusion_matrix[1, 1] + 1e-7)
         return Pre
 
     def Pixel_Recall_Rate(self):
         assert self.confusion_matrix.shape[0] == 2
-        Rec = self.confusion_matrix[1, 1] / (self.confusion_matrix[1, 0] + self.confusion_matrix[1, 1])
+        Rec = self.confusion_matrix[1, 1] / (self.confusion_matrix[1, 0] + self.confusion_matrix[1, 1] + 1e-7)
         return Rec
 
     def Pixel_F1_score(self):
         assert self.confusion_matrix.shape[0] == 2
         Rec = self.Pixel_Recall_Rate()
         Pre = self.Pixel_Precision_Rate()
-        F1 = 2 * Rec * Pre / (Rec + Pre)
+        F1 = 2 * Rec * Pre / (Rec + Pre + 1e-7)
         return F1
 
 
@@ -56,7 +56,7 @@ class Evaluator(object):
 
     def Intersection_over_Union(self):
         IoU = self.confusion_matrix[1, 1] / (
-                self.confusion_matrix[0, 1] + self.confusion_matrix[1, 0] + self.confusion_matrix[1, 1])
+                self.confusion_matrix[0, 1] + self.confusion_matrix[1, 0] + self.confusion_matrix[1, 1] + 1e-7)
         return IoU
 
     def Kappa_coefficient(self):

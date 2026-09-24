@@ -1,4 +1,5 @@
 import os
+import random
 import numpy as np
 from PIL import Image
 
@@ -32,11 +33,12 @@ class ChangeDetectionDataset(Dataset):
     A = T1 image, B = T2 image, label = binary change mask (gray >= 128).
     """
 
-    def __init__(self, dataset_path, data_list, crop_size=256, type='train'):
+    def __init__(self, dataset_path, data_list, crop_size=256, type='train', temporal_swap_prob=0.0):
         self.dataset_path = dataset_path
         self.data_list = data_list
         self.type = type
         self.crop_size = crop_size
+        self.temporal_swap_prob = temporal_swap_prob
 
     def _transforms(self, pre_img, post_img, label):
         if self.type == 'train':
@@ -44,6 +46,9 @@ class ChangeDetectionDataset(Dataset):
             pre_img, post_img, label = imutils.random_fliplr(pre_img, post_img, label)
             pre_img, post_img, label = imutils.random_flipud(pre_img, post_img, label)
             pre_img, post_img, label = imutils.random_rot(pre_img, post_img, label)
+            # temporal swap: (A,B)->(B,A), label unchanged
+            if self.temporal_swap_prob > 0 and random.random() < self.temporal_swap_prob:
+                pre_img, post_img = post_img, pre_img
 
         # ImageNet normalization (official VMamba normalization) for A/B only.
         pre_img = imutils.normalize_img(pre_img)

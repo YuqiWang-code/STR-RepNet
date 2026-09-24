@@ -78,7 +78,7 @@ def random_flipud_mcd(pre_img, post_img, label_cd, label_1, label_2):
 
 
 def random_rot(pre_img, post_img, label):
-    k = random.randrange(3) + 1
+    k = random.randrange(4)  # 0/90/180/270
 
     pre_img = np.rot90(pre_img, k).copy()
     post_img = np.rot90(post_img, k).copy()

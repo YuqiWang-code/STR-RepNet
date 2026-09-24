@@ -1,9 +1,4 @@
-"""DCR decoder: RepLocalBlock + top-down multi-scale DCRDecoder.
-
-The decoder contains no SSM / attention / SE. Global modeling is done by the
-frozen VMamba encoder; this decoder only does temporal change extraction,
-local refinement and cross-scale fusion, all as foldable Rep operators.
-"""
+"""DCR decoder: RepLocalBlock + top-down multi-scale DCRDecoder (v2 BN-FR primitives)."""
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -16,13 +11,13 @@ from changedetection.models.reparam import (
 
 
 class RepLocalBlock(nn.Module):
-    """Local refinement block: DW3 (identity) -> SiLU -> PW1 -> SiLU."""
+    """Local refinement block: DW3 (residual) -> SiLU -> PW1 (residual) -> SiLU."""
 
-    def __init__(self, dim, use_aux=True, deploy=False):
+    def __init__(self, dim, use_aux=True, use_residual=True, deploy=False):
         super().__init__()
         self.dim = dim
-        self.dw = RepDW3(dim, include_identity=True, use_aux=use_aux, deploy=deploy)
-        self.pw = RepPW1x1(dim, use_aux=use_aux, deploy=deploy)
+        self.dw = RepDW3(dim, use_aux=use_aux, use_residual=use_residual, deploy=deploy)
+        self.pw = RepPW1x1(dim, use_aux=use_aux, use_residual=use_residual, deploy=deploy)
         self.act = nn.SiLU()
 
     def forward(self, x):
@@ -37,24 +32,24 @@ class RepLocalBlock(nn.Module):
 
 
 class DCRDecoder(nn.Module):
-    """Top-down multi-scale decoder over TAR features [t1,t2,t3,t4] (160ch)."""
+    """Top-down multi-scale decoder over TAR features [t1,t2,t3,t4] (dim ch)."""
 
-    def __init__(self, dim=160, use_aux=True, deploy=False):
+    def __init__(self, dim=160, use_aux=True, use_residual=True, deploy=False):
         super().__init__()
         self.dim = dim
         self.use_aux = use_aux
         self.act = nn.SiLU()
 
-        self.fuse3 = RepPairFuse1x1(dim, use_aux=use_aux, deploy=deploy)
-        self.block3 = RepLocalBlock(dim, use_aux=use_aux, deploy=deploy)
+        self.fuse3 = RepPairFuse1x1(dim, use_aux=use_aux, use_residual=use_residual, deploy=deploy)
+        self.block3 = RepLocalBlock(dim, use_aux=use_aux, use_residual=use_residual, deploy=deploy)
 
-        self.fuse2 = RepPairFuse1x1(dim, use_aux=use_aux, deploy=deploy)
-        self.block2 = RepLocalBlock(dim, use_aux=use_aux, deploy=deploy)
+        self.fuse2 = RepPairFuse1x1(dim, use_aux=use_aux, use_residual=use_residual, deploy=deploy)
+        self.block2 = RepLocalBlock(dim, use_aux=use_aux, use_residual=use_residual, deploy=deploy)
 
-        self.fuse1 = RepPairFuse1x1(dim, use_aux=use_aux, deploy=deploy)
-        self.block1 = RepLocalBlock(dim, use_aux=use_aux, deploy=deploy)
+        self.fuse1 = RepPairFuse1x1(dim, use_aux=use_aux, use_residual=use_residual, deploy=deploy)
+        self.block1 = RepLocalBlock(dim, use_aux=use_aux, use_residual=use_residual, deploy=deploy)
 
-        self.refine = RepLocalBlock(dim, use_aux=use_aux, deploy=deploy)
+        self.refine = RepLocalBlock(dim, use_aux=use_aux, use_residual=use_residual, deploy=deploy)
 
     def forward(self, feats):
         t1, t2, t3, t4 = feats

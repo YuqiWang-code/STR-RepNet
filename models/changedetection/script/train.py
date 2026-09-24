@@ -8,6 +8,7 @@ import os
 import sys
 import time
 import argparse
+import random
 
 import numpy as np
 import torch
@@ -75,16 +76,23 @@ class Trainer(object):
         self.config = config
         self.log = log
 
+        random.seed(args.seed)
         torch.manual_seed(args.seed)
         np.random.seed(args.seed)
+        torch.cuda.manual_seed_all(args.seed)
 
         self.model = self._build_model(config)
         self.model = self.model.cuda()
 
-        trainable_params = [p for p in self.model.parameters() if p.requires_grad]
-        self.optimizer = optim.AdamW(
-            trainable_params, lr=args.learning_rate, weight_decay=args.weight_decay
-        )
+        # param groups: decoder (1e-4) + optionally unfrozen encoder (smaller LR)
+        encoder_params, decoder_params = [], []
+        for name, p in self.model.named_parameters():
+            if p.requires_grad:
+                (encoder_params if name.startswith("encoder.") else decoder_params).append(p)
+        param_groups = [{"params": decoder_params, "lr": args.learning_rate}]
+        if encoder_params:
+            param_groups.append({"params": encoder_params, "lr": args.learning_rate * args.encoder_lr_ratio})
+        self.optimizer = optim.AdamW(param_groups, lr=args.learning_rate, weight_decay=args.weight_decay)
 
         self.train_list = read_list(args.train_list)
         self.test_list = read_list(args.test_list)
@@ -107,6 +115,8 @@ class Trainer(object):
         model = STRRepNet(
             pretrained=self.args.pretrained_weight_path,
             rep_mode=self.args.rep_mode,
+            use_residual=self.args.use_residual,
+            encoder_train=self.args.encoder_train,
             patch_size=v.PATCH_SIZE,
             in_chans=v.IN_CHANS,
             num_classes=config.MODEL.NUM_CLASSES,
@@ -155,7 +165,9 @@ class Trainer(object):
 
     def _make_loader(self, list_path, batch_size, shuffle, drop_last):
         dataset = ChangeDetectionDataset(
-            self.args.dataset_root, read_list(list_path), self.args.crop_size, type=('train' if shuffle else 'test')
+            self.args.dataset_root, read_list(list_path), self.args.crop_size,
+            type=('train' if shuffle else 'test'),
+            temporal_swap_prob=(self.args.temporal_swap_prob if shuffle else 0.0),
         )
         return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle,
                           num_workers=self.args.num_workers, drop_last=drop_last, pin_memory=True)
@@ -328,7 +340,11 @@ def main():
     parser.add_argument('--learning_rate', type=float, default=1e-4)
     parser.add_argument('--weight_decay', type=float, default=5e-4)
     parser.add_argument('--lovasz_weight', type=float, default=2.0)
-    parser.add_argument('--rep_mode', type=str, default='full', choices=['plain', 'tar', 'full'])
+    parser.add_argument('--rep_mode', type=str, default='full', choices=['plain', 'tar', 'dcr', 'full'])
+    parser.add_argument('--use_residual', type=int, default=1)
+    parser.add_argument('--encoder_train', type=str, default='frozen', choices=['frozen', 'last2', 'full'])
+    parser.add_argument('--encoder_lr_ratio', type=float, default=0.1)
+    parser.add_argument('--temporal_swap_prob', type=float, default=0.0)
     parser.add_argument('--num_workers', type=int, default=8)
     parser.add_argument('--seed', type=int, default=2333)
     parser.add_argument('--resume', type=str, default=None)
