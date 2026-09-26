@@ -36,6 +36,7 @@ Lightweight Spatial-Temporal Structural Re-parameterization Network for Remote S
 - **TAR**（Temporal Algebraic Re-parameterization）：四级二时相 bridge，训练期 Concat + Sum + signed-Diff 三路 → 部署期折叠为单个 1×1
 - **DCR**（Decoder-wide Compositional Re-parameterization）：RepDW3 / RepPW1x1 / RepPairFuse1x1，整个 decoder 的可折叠算子图
 - **Edge-Basis**（Run3 迭代，已验证未达判据、未纳入主方法）：在 `DCRDecoder.refine.dw` 增加可折叠的 Sobel-X/Y 结构边缘基分支，部署仍折叠为单个 DW3×3（`--use_edge`）
+- **IBAS**（Run4 迭代，辅助训练机制）：最终 decoder feature 上挂 161 参数零初始化训练期边界头，GT 内侧边界（`B⁺=Y−Erode3×3(Y)`）在线生成，`BCE+Dice` 加权 0.1，`switch_to_deploy` 整支删除（`--use_boundary_aux`，部署 +0 参数/FLOPs）
 
 - 模型入口：`models/changedetection/models/STRRepNet.py`（`STRRepNet`）
 - 核心文件：`reparam.py`（代数折叠原语）、`tar.py`（二时相 bridge）、`dcr_decoder.py`（多尺度解码器）
@@ -111,6 +112,14 @@ Run2 在 Run1 基础上做了两处改造（部署图/参数/FLOPs 完全不变�
 - 细节：LEVIR Recall 相对锚点微升 +0.14pp（0.9032→0.9046，边缘基对召回有微弱正作用），但 Precision 掉 -0.35pp（0.926→0.9225），净 F1 微负；4 数据集均无净正贡献（SYSU 掉点最多）。
 - 部署不变：28.83M 参数 / 12.61G FLOPs；fold 误差 1.0e-5~7.2e-5（<1e-4）。
 - 结论：Edge-Basis 不作为主方法，当前最佳仍为 Run2 full_last2；下一步候选见「训练期边界监督（部署删除）」方向。
+
+## 实验结果（Run4：IBAS，进行中）
+
+- 单变量：训练期内侧边界辅助监督 IBAS（boundary head `Conv2d(160→1)` 零初始化、`B⁺=Y−Erode3×3(Y)` 内侧边界、`BCE+Dice`、λ=0.1），部署删除 +0 参数/FLOPs。
+- 基线：Run2 full_last2（CDD 0.9842 / LEVIR 0.9144 / WHU 0.9514 / SYSU 0.8345）；4 数据集并行（GPU1）。
+- 配置：`full + last2 + use_residual 1 + use_edge 0 + use_boundary_aux 1 + boundary_weight 0.1`，seed 2333，300 epoch。
+- 判据（LEVIR 主判据）：F1≥0.9175 / IoU≥0.8475 / Precision≥0.9240；失败线 F1<0.9159；另 3 数据集防掉点。
+- 设计文档：[`docs/temporary/STR-RepNet_Run4_IBAS_训练期内侧边界辅助监督方案.md`](docs/temporary/STR-RepNet_Run4_IBAS_训练期内侧边界辅助监督方案.md)。
 
 ## 参考文献
 

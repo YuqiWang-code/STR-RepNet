@@ -25,6 +25,7 @@ from changedetection.configs.config import get_config
 from changedetection.datasets.make_data_loader import ChangeDetectionDataset, read_list
 from changedetection.utils_func.metrics import Evaluator
 from changedetection.utils_func import lovasz_loss as L
+from changedetection.utils_func import boundary_loss as BL
 from changedetection.models.STRRepNet import STRRepNet
 
 
@@ -118,6 +119,7 @@ class Trainer(object):
             use_residual=self.args.use_residual,
             use_edge=self.args.use_edge,
             encoder_train=self.args.encoder_train,
+            use_boundary_aux=bool(self.args.use_boundary_aux),
             patch_size=v.PATCH_SIZE,
             in_chans=v.IN_CHANS,
             num_classes=config.MODEL.NUM_CLASSES,
@@ -204,6 +206,7 @@ class Trainer(object):
             self.model.train()
             ce_sum = 0.0
             lovasz_sum = 0.0
+            boundary_sum = 0.0
             total_sum = 0.0
             n_batches = 0
 
@@ -212,11 +215,19 @@ class Trainer(object):
                 post = post.cuda().float()
                 label = label.cuda().long()
 
-                output = self.model(pre, post)
+                if self.args.use_boundary_aux:
+                    output, boundary_logits = self.model(pre, post, return_aux=True)
+                else:
+                    output = self.model(pre, post)
 
                 ce_loss = F.cross_entropy(output, label, ignore_index=255)
                 lovasz = L.lovasz_softmax(F.softmax(output, dim=1), label, ignore=255)
                 total_loss = ce_loss + self.args.lovasz_weight * lovasz
+                if self.args.use_boundary_aux:
+                    b_loss = BL.boundary_loss(boundary_logits, label)
+                    total_loss = total_loss + self.args.boundary_weight * b_loss
+                else:
+                    b_loss = torch.zeros((), device=total_loss.device)
 
                 self.optimizer.zero_grad()
                 total_loss.backward()
@@ -225,6 +236,8 @@ class Trainer(object):
                 ce_sum += ce_loss.item()
                 lovasz_sum += lovasz.item()
                 total_sum += total_loss.item()
+                if self.args.use_boundary_aux:
+                    boundary_sum += b_loss.item()
                 n_batches += 1
 
             ce_avg = ce_sum / n_batches
@@ -235,9 +248,11 @@ class Trainer(object):
             rec, pre_, oa, f1, iou, kc = self._evaluate(test_loader)
 
             line = (f"Epoch {epoch + 1}/{self.args.epochs} | "
-                    f"CE={ce_avg:.4f} | Lovasz={lovasz_avg:.4f} | Total={total_avg:.4f} | "
-                    f"Recall={rec:.4f} | Precision={pre_:.4f} | OA={oa:.4f} | "
-                    f"F1={f1:.4f} | IoU={iou:.4f} | Kappa={kc:.4f}")
+                    f"CE={ce_avg:.4f} | Lovasz={lovasz_avg:.4f} | Total={total_avg:.4f} | ")
+            if self.args.use_boundary_aux:
+                line += f"Boundary={boundary_sum / n_batches:.4f} | "
+            line += (f"Recall={rec:.4f} | Precision={pre_:.4f} | OA={oa:.4f} | "
+                     f"F1={f1:.4f} | IoU={iou:.4f} | Kappa={kc:.4f}")
             self.log(line)
 
             # Save last (resume) + best (test).
@@ -344,6 +359,8 @@ def main():
     parser.add_argument('--rep_mode', type=str, default='full', choices=['plain', 'tar', 'dcr', 'full'])
     parser.add_argument('--use_residual', type=int, default=1)
     parser.add_argument('--use_edge', type=int, default=0)
+    parser.add_argument('--use_boundary_aux', type=int, default=0)
+    parser.add_argument('--boundary_weight', type=float, default=0.1)
     parser.add_argument('--encoder_train', type=str, default='frozen', choices=['frozen', 'last2', 'full'])
     parser.add_argument('--encoder_lr_ratio', type=float, default=0.1)
     parser.add_argument('--temporal_swap_prob', type=float, default=0.0)
