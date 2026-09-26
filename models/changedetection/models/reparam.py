@@ -48,14 +48,25 @@ def identity_1x1_kernel(channels, device=None, dtype=torch.float32):
     return torch.eye(channels, device=device, dtype=dtype).view(channels, channels, 1, 1)
 
 
+# Fixed Sobel edge basis (3x3), used by RepDW3's optional edge branch. Normalized by 1/8.
+SOBEL_X = torch.tensor([[-1., 0., 1.], [-2., 0., 2.], [-1., 0., 1.]]) / 8.0
+SOBEL_Y = SOBEL_X.t().contiguous()  # K_x^T
+
+
+def _sobel_dw_kernel(channels, sobel, device=None, dtype=torch.float32):
+    """Broadcast a single 3x3 Sobel kernel to a (channels, 1, 3, 3) depthwise kernel."""
+    return sobel.to(device=device, dtype=dtype).view(1, 1, 3, 3).repeat(channels, 1, 1, 1)
+
+
 class RepDW3(nn.Module):
     """Depthwise Rep 3x3: DW3x3 + DW1x3 + DW3x1 (each with own BN) + alpha*x -> single DW3x3."""
 
-    def __init__(self, channels, use_aux=True, use_residual=True, deploy=False):
+    def __init__(self, channels, use_aux=True, use_residual=True, use_edge=False, deploy=False):
         super().__init__()
         self.channels = channels
         self.use_aux = use_aux
         self.use_residual = use_residual
+        self.use_edge = use_edge
         self.deploy = deploy
         if deploy:
             self.dw = nn.Conv2d(channels, channels, 3, 1, 1, groups=channels, bias=True)
@@ -72,6 +83,11 @@ class RepDW3(nn.Module):
                 nn.init.zeros_(self.dw31.weight)
             if self.use_residual:
                 self.alpha = nn.Parameter(torch.ones(1))
+            if self.use_edge:
+                self.register_buffer("sobel_x", _sobel_dw_kernel(channels, SOBEL_X), persistent=False)
+                self.register_buffer("sobel_y", _sobel_dw_kernel(channels, SOBEL_Y), persistent=False)
+                self.beta_x = nn.Parameter(torch.zeros(channels))
+                self.beta_y = nn.Parameter(torch.zeros(channels))
 
     def forward(self, x):
         if self.deploy:
@@ -81,6 +97,11 @@ class RepDW3(nn.Module):
             y = y + self.bn13(self.dw13(x)) + self.bn31(self.dw31(x))
         if self.use_residual:
             y = y + self.alpha * x
+        if self.use_edge:
+            edge_x = F.conv2d(x, self.sobel_x, padding=1, groups=self.channels)
+            edge_y = F.conv2d(x, self.sobel_y, padding=1, groups=self.channels)
+            y = y + self.beta_x.view(1, self.channels, 1, 1) * edge_x \
+                  + self.beta_y.view(1, self.channels, 1, 1) * edge_y
         return y
 
     def get_equivalent_kernel_bias(self):
@@ -93,6 +114,9 @@ class RepDW3(nn.Module):
                   + fold_conv_bn(self.dw31.weight, None, self.bn31)[1]
         if self.use_residual:
             k = k + self.alpha.detach() * identity_dw_kernel(self.channels, 3, device=k.device, dtype=torch.float32)
+        if self.use_edge:
+            k = k + self.beta_x.detach().view(self.channels, 1, 1, 1) * self.sobel_x \
+                  + self.beta_y.detach().view(self.channels, 1, 1, 1) * self.sobel_y
         return k, b
 
     def branch_stats(self):
@@ -112,7 +136,7 @@ class RepDW3(nn.Module):
         self.dw.weight.data = kernel
         self.dw.bias.data = bias
         self.deploy = True
-        for name in ("dw13", "dw31", "bn3", "bn13", "bn31", "dw3", "alpha"):
+        for name in ("dw13", "dw31", "bn3", "bn13", "bn31", "dw3", "alpha", "beta_x", "beta_y", "sobel_x", "sobel_y"):
             if hasattr(self, name):
                 delattr(self, name)
         return self

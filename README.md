@@ -24,11 +24,18 @@ Lightweight Spatial-Temporal Structural Re-parameterization Network for Remote S
 服务器与数据规范见
 [`docs/RSML-3_服务器环境与变化检测数据统一说明.md`](docs/RSML-3_服务器环境与变化检测数据统一说明.md)。
 
+## 研究定位与约定
+
+- **方法创新导向**：这是研究生论文课题，核心是方法创新（结构重参数化），不做工程化堆叠，也不把 loss 调参 / 训练技巧包装成创新贡献。
+- **单 seed（2333）**：当前阶段只用单 seed 验证有效性与创新性，不做多 seed 统计显著；如需论文级结果，再按需补充。
+- **训练协议**：从 ChangeMamba 起，后续 Mamba-based 的 BCD 模型都是「test 集当验证集、每 epoch 在 test 上挑 best」，本项目沿用同一协议。当前处于**长期迭代改进期**，暂不做正式 train/val/test 分离 + corrected-reproduction 的协议重跑，等方法收敛后再做。
+
 ## 方法（STR-RepNet / Clean TAR-DCR）
 
 - **Encoder**：Frozen VMamba-Tiny Siamese（不改结构、不参与训练；预训练权重 `vssm_tiny_0230_ckpt_epoch_262.pth`）
 - **TAR**（Temporal Algebraic Re-parameterization）：四级二时相 bridge，训练期 Concat + Sum + signed-Diff 三路 → 部署期折叠为单个 1×1
 - **DCR**（Decoder-wide Compositional Re-parameterization）：RepDW3 / RepPW1x1 / RepPairFuse1x1，整个 decoder 的可折叠算子图
+- **Edge-Basis**（Run3 迭代，已验证未达判据、未纳入主方法）：在 `DCRDecoder.refine.dw` 增加可折叠的 Sobel-X/Y 结构边缘基分支，部署仍折叠为单个 DW3×3（`--use_edge`）
 
 - 模型入口：`models/changedetection/models/STRRepNet.py`（`STRRepNet`）
 - 核心文件：`reparam.py`（代数折叠原语）、`tar.py`（二时相 bridge）、`dcr_decoder.py`（多尺度解码器）
@@ -87,6 +94,23 @@ Run2 在 Run1 基础上做了两处改造（部署图/参数/FLOPs 完全不变�
 - **BN-FR 有效（零部署增量）**：full_frozen 相对 Run1 Full 提升 LEVIR +0.61 / SYSU +1.28。
 - **冻结 encoder 是 Run1 落后 baseline 的主因**：解冻后两级再提升 +0.50 / +0.93，`full_last2` 在 SYSU 上反超 baseline（0.8345 > 0.8299）。
 - temporal aux 贡献：LEVIR 上很小（full≈dcr，+0.04），SYSU 上 +0.51。
+
+## 实验结果（Run3：Edge-Basis，已完成）
+
+- 单变量：`DCRDecoder.refine.dw` 增加 Sobel-X/Y 结构边缘基分支（β 零初始化，部署折叠 +0 参数/FLOPs）。
+- 4 数据集并行（full + last2 + use_residual 1 + use_edge 1，seed 2333，300 epoch）：
+
+| 数据集 | Run3 Edge-Basis | Run2 full_last2 锚点 | ΔF1 | HAM-CD baseline |
+|---|---|---|---|---|
+| LEVIR | 0.9135 | 0.9144 | -0.09 | 0.9211 |
+| CDD | 0.9841 | 0.9842 | -0.01 | 0.9879 |
+| WHU | 0.9497 | 0.9514 | -0.17 | 0.9500 |
+| SYSU | 0.8311 | 0.8345 | -0.34 | 0.8299 |
+
+- 判据（LEVIR F1≥0.9175、Recall≥0.907）**未达成**：F1=0.9135 / Recall=0.9046。
+- 细节：LEVIR Recall 相对锚点微升 +0.14pp（0.9032→0.9046，边缘基对召回有微弱正作用），但 Precision 掉 -0.35pp（0.926→0.9225），净 F1 微负；4 数据集均无净正贡献（SYSU 掉点最多）。
+- 部署不变：28.83M 参数 / 12.61G FLOPs；fold 误差 1.0e-5~7.2e-5（<1e-4）。
+- 结论：Edge-Basis 不作为主方法，当前最佳仍为 Run2 full_last2；下一步候选见「训练期边界监督（部署删除）」方向。
 
 ## 参考文献
 

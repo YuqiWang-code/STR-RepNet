@@ -24,11 +24,12 @@ from changedetection.models.dcr_decoder import DCRDecoder
 
 class STRRepNet(nn.Module):
     def __init__(self, pretrained=None, rep_mode="full", dim=160, use_residual=True,
-                 encoder_train="frozen", **encoder_kwargs):
+                 use_edge=False, encoder_train="frozen", **encoder_kwargs):
         super().__init__()
         self.rep_mode = rep_mode
         self.dim = dim
         self.use_residual = use_residual
+        self.use_edge = use_edge
         self.encoder_train = encoder_train
 
         self.encoder = Backbone_VSSM(out_indices=(0, 1, 2, 3), pretrained=pretrained, **encoder_kwargs)
@@ -42,7 +43,7 @@ class STRRepNet(nn.Module):
             use_temporal_aux=use_temporal_aux, use_dcr_aux=use_dcr_aux,
             use_residual=use_residual,
         )
-        self.decoder = DCRDecoder(dim=dim, use_aux=use_dcr_aux, use_residual=use_residual)
+        self.decoder = DCRDecoder(dim=dim, use_aux=use_dcr_aux, use_residual=use_residual, use_edge=use_edge)
         self.head = nn.Conv2d(dim, 2, 1)
 
     def _setup_encoder_train(self):

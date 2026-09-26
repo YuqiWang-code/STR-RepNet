@@ -13,10 +13,10 @@ from changedetection.models.reparam import (
 class RepLocalBlock(nn.Module):
     """Local refinement block: DW3 (residual) -> SiLU -> PW1 (residual) -> SiLU."""
 
-    def __init__(self, dim, use_aux=True, use_residual=True, deploy=False):
+    def __init__(self, dim, use_aux=True, use_residual=True, use_edge=False, deploy=False):
         super().__init__()
         self.dim = dim
-        self.dw = RepDW3(dim, use_aux=use_aux, use_residual=use_residual, deploy=deploy)
+        self.dw = RepDW3(dim, use_aux=use_aux, use_residual=use_residual, use_edge=use_edge, deploy=deploy)
         self.pw = RepPW1x1(dim, use_aux=use_aux, use_residual=use_residual, deploy=deploy)
         self.act = nn.SiLU()
 
@@ -34,7 +34,7 @@ class RepLocalBlock(nn.Module):
 class DCRDecoder(nn.Module):
     """Top-down multi-scale decoder over TAR features [t1,t2,t3,t4] (dim ch)."""
 
-    def __init__(self, dim=160, use_aux=True, use_residual=True, deploy=False):
+    def __init__(self, dim=160, use_aux=True, use_residual=True, use_edge=False, deploy=False):
         super().__init__()
         self.dim = dim
         self.use_aux = use_aux
@@ -49,7 +49,7 @@ class DCRDecoder(nn.Module):
         self.fuse1 = RepPairFuse1x1(dim, use_aux=use_aux, use_residual=use_residual, deploy=deploy)
         self.block1 = RepLocalBlock(dim, use_aux=use_aux, use_residual=use_residual, deploy=deploy)
 
-        self.refine = RepLocalBlock(dim, use_aux=use_aux, use_residual=use_residual, deploy=deploy)
+        self.refine = RepLocalBlock(dim, use_aux=use_aux, use_residual=use_residual, use_edge=use_edge, deploy=deploy)
 
     def forward(self, feats):
         t1, t2, t3, t4 = feats

@@ -116,6 +116,7 @@ class Trainer(object):
             pretrained=self.args.pretrained_weight_path,
             rep_mode=self.args.rep_mode,
             use_residual=self.args.use_residual,
+            use_edge=self.args.use_edge,
             encoder_train=self.args.encoder_train,
             patch_size=v.PATCH_SIZE,
             in_chans=v.IN_CHANS,
@@ -342,6 +343,7 @@ def main():
     parser.add_argument('--lovasz_weight', type=float, default=2.0)
     parser.add_argument('--rep_mode', type=str, default='full', choices=['plain', 'tar', 'dcr', 'full'])
     parser.add_argument('--use_residual', type=int, default=1)
+    parser.add_argument('--use_edge', type=int, default=0)
     parser.add_argument('--encoder_train', type=str, default='frozen', choices=['frozen', 'last2', 'full'])
     parser.add_argument('--encoder_lr_ratio', type=float, default=0.1)
     parser.add_argument('--temporal_swap_prob', type=float, default=0.0)
