@@ -113,12 +113,22 @@ Run2 在 Run1 基础上做了两处改造（部署图/参数/FLOPs 完全不变�
 - 部署不变：28.83M 参数 / 12.61G FLOPs；fold 误差 1.0e-5~7.2e-5（<1e-4）。
 - 结论：Edge-Basis 不作为主方法，当前最佳仍为 Run2 full_last2；下一步候选见「训练期边界监督（部署删除）」方向。
 
-## 实验结果（Run4：IBAS，进行中）
+## 实验结果（Run4：IBAS，已完成）
 
 - 单变量：训练期内侧边界辅助监督 IBAS（boundary head `Conv2d(160→1)` 零初始化、`B⁺=Y−Erode3×3(Y)` 内侧边界、`BCE+Dice`、λ=0.1），部署删除 +0 参数/FLOPs。
-- 基线：Run2 full_last2（CDD 0.9842 / LEVIR 0.9144 / WHU 0.9514 / SYSU 0.8345）；4 数据集并行（GPU1）。
-- 配置：`full + last2 + use_residual 1 + use_edge 0 + use_boundary_aux 1 + boundary_weight 0.1`，seed 2333，300 epoch。
-- 判据（LEVIR 主判据）：F1≥0.9175 / IoU≥0.8475 / Precision≥0.9240；失败线 F1<0.9159；另 3 数据集防掉点。
+- 基线：Run2 full_last2；4 数据集并行（GPU1）；`full + last2 + use_residual 1 + use_edge 0 + use_boundary_aux 1 + boundary_weight 0.1`，seed 2333，300 epoch。
+
+| 数据集 | Run4 IBAS | Run2 full_last2 锚点 | ΔF1 | Run3 Edge-Basis | HAM-CD baseline |
+|---|---|---|---|---|---|
+| LEVIR | 0.9145 | 0.9144 | +0.01 | 0.9135 | 0.9211 |
+| CDD | 0.9839 | 0.9842 | -0.03 | 0.9841 | 0.9879 |
+| WHU | 0.9508 | 0.9514 | -0.06 | 0.9497 | 0.9500 |
+| SYSU | 0.8324 | 0.8345 | -0.21 | 0.8311 | 0.8299 |
+
+- 判据（LEVIR：F1≥0.9175 / IoU≥0.8475 / Precision≥0.9240）**未达成**：F1=0.9145 / IoU=0.8424 / Precision=0.9269（F1 低于失败线 0.9159 → 按预注册协议不再做 λ sweep）。
+- 细节：IBAS 相对 Run3 全面更好（LEVIR +0.10 / WHU +0.11 / SYSU +0.13，CDD -0.02），且 LEVIR Precision 相对锚点 +0.09pp（0.9260→0.9269，实现「不丢精度」的设计目标），但 Recall 微降（0.9032→0.9023），净 F1 持平锚点、无增益。
+- 部署不变：28.83M 参数 / 12.61G FLOPs；fold 误差 8.6e-6~3.8e-5（<1e-4）。
+- 结论：IBAS 是「中性」机制（持平锚点、优于 Run3），未带来判据级提升；当前最佳仍为 Run2 full_last2。WHU/SYSU 仍反超 baseline（+0.08 / +0.25）。
 - 设计文档：[`docs/temporary/STR-RepNet_Run4_IBAS_训练期内侧边界辅助监督方案.md`](docs/temporary/STR-RepNet_Run4_IBAS_训练期内侧边界辅助监督方案.md)。
 
 ## 参考文献
