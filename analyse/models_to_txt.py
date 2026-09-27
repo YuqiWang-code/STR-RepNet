@@ -70,13 +70,14 @@ def main():
 
         metrics = collect_metrics()
         out.write(f"\n{'=' * 80}\n## METRICS ({len(metrics)} results)\n{'=' * 80}\n")
-        out.write("Run | " + " | ".join(METRIC_KEYS) + " | Params(M) | Trainable(M) | FLOPs(G) | ReparamErr | RepMode\n")
+        out.write("Run | " + " | ".join(METRIC_KEYS) + " | TrainGraphParams(M) | TrainableParams(M) | DeployParams(M) | DeployFLOPs(G) | ReparamErr | RepMode\n")
         for rel, info in metrics:
             line = [rel] + [f"{info.get(k):.4f}" if info.get(k) is not None else "-" for k in METRIC_KEYS]
             line += [
-                f"{info['Params(M)']:.3f}" if info.get("Params(M)") is not None else "-",
-                f"{info['Trainable(M)']:.3f}" if info.get("Trainable(M)") is not None else "-",
-                f"{info['FLOPs(G)']:.4f}" if info.get("FLOPs(G)") is not None else "-",
+                f"{info['TrainGraphParams(M)']:.3f}" if info.get("TrainGraphParams(M)") is not None else "-",
+                f"{info['TrainableParams(M)']:.3f}" if info.get("TrainableParams(M)") is not None else "-",
+                f"{info['DeployParams(M)']:.3f}" if info.get("DeployParams(M)") is not None else "-",
+                f"{info['DeployFLOPs(G)']:.4f}" if info.get("DeployFLOPs(G)") is not None else "-",
                 f"{info['ReparamErr']:.3e}" if info.get("ReparamErr") is not None else "-",
                 info.get("RepMode") or "-",
             ]

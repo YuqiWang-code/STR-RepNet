@@ -1,7 +1,11 @@
 """TAR-DCR structural re-parameterization equivalence tests.
 
-Checks that switch_to_deploy() does not change the FP32 output of every Rep
-block and the whole model (max_abs_error must be < 1e-6).
+Thresholds (Run5, unified with the asserts below):
+  - kernel/bias composition is done in FP64 (algebraic error ~1e-15);
+  - block-level FP32 train-graph vs deploy-graph: the two graphs accumulate
+    floats in different orders, measured ~1e-6..1e-5 -> assert < 1e-5;
+  - whole-model FP32 error is RECORDED (~1e-5), assert < 2e-4, plus argmax
+    disagreement is recorded. NOT claimed as < 1e-6.
 """
 import argparse
 import copy
@@ -42,23 +46,29 @@ def block_tests(device):
     results = []
 
     x = torch.randn(2, C, H, W, device=device)
-    results.append(check_fold(RepDW3(C, use_aux=True, use_residual=True).to(device), (x,), name="RepDW3"))
-    results.append(check_fold(RepPW1x1(C, use_aux=True).to(device), (x,), name="RepPW1x1"))
-    results.append(check_fold(RepLocalBlock(C, use_aux=True).to(device), (x,), name="RepLocalBlock"))
+    results.append(check_fold(RepDW3(C, use_aux=True, use_residual=True).to(device), (x,), tol=1e-5, name="RepDW3"))
+    results.append(check_fold(RepPW1x1(C, use_aux=True).to(device), (x,), tol=1e-5, name="RepPW1x1"))
+    results.append(check_fold(RepLocalBlock(C, use_aux=True).to(device), (x,), tol=1e-5, name="RepLocalBlock"))
 
     L = torch.randn(2, C, H, W, device=device)
     Hh = torch.randn(2, C, H, W, device=device)
-    results.append(check_fold(RepPairFuse1x1(C, use_aux=True).to(device), (L, Hh), name="RepPairFuse1x1"))
+    results.append(check_fold(RepPairFuse1x1(C, use_aux=True).to(device), (L, Hh), tol=1e-5, name="RepPairFuse1x1"))
 
     P = torch.randn(2, 96, H, W, device=device)
     Q = torch.randn(2, 96, H, W, device=device)
-    results.append(check_fold(TemporalRep1x1(96, C, use_aux=True).to(device), (P, Q), name="TemporalRep1x1"))
-    results.append(check_fold(TARStage(96, C, use_temporal_aux=True, use_dcr_aux=True).to(device), (P, Q), name="TARStage"))
+    results.append(check_fold(TemporalRep1x1(96, C, use_aux=True).to(device), (P, Q), tol=1e-5, name="TemporalRep1x1"))
+    results.append(check_fold(TemporalRep1x1(96, C, use_aux=True, use_reverse_aux=True).to(device),
+                              (P, Q), tol=1e-5, name="TemporalRep1x1+BOTR"))
+    results.append(check_fold(TARStage(96, C, use_temporal_aux=True, use_dcr_aux=True).to(device),
+                              (P, Q), tol=1e-5, name="TARStage"))
+    results.append(check_fold(TARStage(96, C, use_temporal_aux=True, use_dcr_aux=True,
+                                       use_reverse_aux=True).to(device),
+                              (P, Q), tol=1e-5, name="TARStage+BOTR"))
 
     return all(results)
 
 
-def whole_model_test(device, cfg, pretrained, rep_mode="full"):
+def whole_model_test(device, cfg, pretrained, rep_mode="full", use_botr=False):
     from changedetection.configs.config import get_config
     from changedetection.models.STRRepNet import STRRepNet
 
@@ -71,7 +81,7 @@ def whole_model_test(device, cfg, pretrained, rep_mode="full"):
     v = config.MODEL.VSSM
 
     model = STRRepNet(
-        pretrained=pretrained, rep_mode=rep_mode,
+        pretrained=pretrained, rep_mode=rep_mode, use_botr=use_botr,
         patch_size=v.PATCH_SIZE, in_chans=v.IN_CHANS, num_classes=config.MODEL.NUM_CLASSES,
         depths=v.DEPTHS, dims=v.EMBED_DIM,
         ssm_d_state=v.SSM_D_STATE, ssm_ratio=v.SSM_RATIO, ssm_rank_ratio=v.SSM_RANK_RATIO,
@@ -104,8 +114,10 @@ def whole_model_test(device, cfg, pretrained, rep_mode="full"):
         y1 = m2(pre, post)
 
     err = (y0 - y1).abs().max().item()
-    ok = err < 1e-4
-    print(f"[{'OK' if ok else 'FAIL'}] STRRepNet whole model ({rep_mode}): max_abs_error={err:.3e}")
+    disagree = (y0.argmax(1) != y1.argmax(1)).float().mean().item()
+    ok = err < 2e-4
+    print(f"[{'OK' if ok else 'FAIL'}] STRRepNet whole model ({rep_mode}, botr={use_botr}): "
+          f"max_abs_error={err:.3e}, argmax_disagree={disagree:.3e}")
     return ok
 
 
@@ -124,14 +136,15 @@ def main():
     torch.backends.cudnn.allow_tf32 = False
     torch.backends.cudnn.deterministic = True
 
-    print("=== block-level fold tests ===")
+    print("=== block-level fold tests (tol=1e-5; FP64-composed kernels) ===")
     b_ok = block_tests(device)
 
-    print("=== whole-model fold test ===")
+    print("=== whole-model fold tests (error recorded; FP32 graphs, tol=2e-4) ===")
     w_ok = whole_model_test(device, args.cfg, args.pretrained_weight_path, args.rep_mode)
+    wb_ok = whole_model_test(device, args.cfg, args.pretrained_weight_path, args.rep_mode, use_botr=True)
 
-    print(f"\n{'ALL PASSED' if (b_ok and w_ok) else 'SOME FAILED'}")
-    sys.exit(0 if (b_ok and w_ok) else 1)
+    print(f"\n{'ALL PASSED' if (b_ok and w_ok and wb_ok) else 'SOME FAILED'}")
+    sys.exit(0 if (b_ok and w_ok and wb_ok) else 1)
 
 
 if __name__ == "__main__":

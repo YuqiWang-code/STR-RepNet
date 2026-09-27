@@ -131,6 +131,14 @@ Run2 在 Run1 基础上做了两处改造（部署图/参数/FLOPs 完全不变�
 - 结论：IBAS 是「中性」机制（持平锚点、优于 Run3），未带来判据级提升；当前最佳仍为 Run2 full_last2。WHU/SYSU 仍反超 baseline（+0.08 / +0.25）。
 - 设计文档：[`docs/temporary/STR-RepNet_Run4_IBAS_训练期内侧边界辅助监督方案.md`](docs/temporary/STR-RepNet_Run4_IBAS_训练期内侧边界辅助监督方案.md)。
 
+## 实验结果（Run5：回退 Run2 + BOTR，进行中）
+
+- **代码回退**：活跃方法主路径恢复 Run2 版本（移除 Edge-Basis/IBAS 活跃代码；历史记录保留）；P0 修复 FP64 folding（组合全程 float64、最后一次性 cast FP32）；P2 拆分 train/deploy 参数统计。
+- **主方案 BOTR**（Bi-Order Temporal Re-parameterization）：TAR 各尺度加零初始化 reverse-concat `W_r[Q,P]` 训练分支（独立 BN），部署时通道置换吸收回单个 temporal 1×1 → **+0 部署参数/FLOPs**（`--use_botr`）。
+- 最小消融（第一阶段 LEVIR × 3，GPU1 并行）：**D0** `encoder_train=full` 上界诊断 / **C1** `temporal_swap_prob=0.5` 必要对照 / **M1** `use_botr=1` 主实验；A0 = Run2 full_last2 已有锚点（不重跑）。
+- 判据（LEVIR 锚点 F1=0.9144）：M1 **PASS** 需 F1≥0.9175 且 Recall≥0.9065 且 Precision≥0.9230 且 IoU≥0.8475；F1<0.9159 → **FAIL** 停止 BOTR；M1 过线后才扩 WHU→SYSU→CDD（脚本已预写）。
+- 设计文档：[`docs/temporary/STR-RepNet_Run5_回退Run2与BOTR最小消融实验方案.md`](docs/temporary/STR-RepNet_Run5_回退Run2与BOTR最小消融实验方案.md)。
+
 ## 参考文献
 
 调研文献按 [`docs/temporary/过去的想法/STR-RepNet_结构重参数化_2024-2026文献调研与创新空白.md`](docs/temporary/过去的想法/STR-RepNet_结构重参数化_2024-2026文献调研与创新空白.md)

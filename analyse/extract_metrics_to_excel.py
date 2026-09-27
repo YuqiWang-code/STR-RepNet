@@ -46,13 +46,15 @@ def parse_block(block):
             float(x) for x in m.groups()
         ]
     # 各种参数/FLOPs 行（baseline 与 TAR-DCR 两种格式）
+    # P2 (Run5): train-graph / trainable / deploy 分开记，论文复杂度只用 deploy 数值。
     def _num(pattern):
         mm = re.search(pattern + r"\s+([0-9.]+)", block)
         return float(mm.group(1)) if mm else None
 
-    d["Params(M)"] = _num(r"\[(?:PARAMS|TOTAL-TRAIN-GRAPH-PARAMS|DEPLOY-PARAMS)\]")
-    d["Trainable(M)"] = _num(r"\[TRAINABLE-PARAMS\]")
-    d["FLOPs(G)"] = _num(r"\[(?:FLOPS|DEPLOY-FLOPS)\]")
+    d["TrainGraphParams(M)"] = _num(r"\[(?:TOTAL-TRAIN-GRAPH-PARAMS|PARAMS)\]")
+    d["TrainableParams(M)"] = _num(r"\[TRAINABLE-PARAMS\]")
+    d["DeployParams(M)"] = _num(r"\[(?:DEPLOY-PARAMS|PARAMS)\]")
+    d["DeployFLOPs(G)"] = _num(r"\[(?:DEPLOY-FLOPS|FLOPS)\]")
     err = re.search(r"\[REPARAM-MAX-ABS-ERROR\]\s+([0-9.eE+-]+)", block)
     d["ReparamErr"] = float(err.group(1)) if err else None
     rm = re.search(r"\[REP-MODE\]\s+(\w+)", block)
@@ -110,7 +112,8 @@ def main():
     ws = wb.active
     ws.title = "metrics"
     headers = ["Tag", "Run", "Experiment", "Dataset"] + METRIC_KEYS + [
-        "Params(M)", "Trainable(M)", "FLOPs(G)", "ReparamErr", "RepMode"
+        "TrainGraphParams(M)", "TrainableParams(M)", "DeployParams(M)", "DeployFLOPs(G)",
+        "ReparamErr", "RepMode"
     ]
     ws.append(headers)
     for c in ws[1]:
@@ -123,7 +126,8 @@ def main():
             for k in METRIC_KEYS
         ]
         row = [tag, run, experiment, dataset] + metrics + [
-            info.get("Params(M)"), info.get("Trainable(M)"), info.get("FLOPs(G)"),
+            info.get("TrainGraphParams(M)"), info.get("TrainableParams(M)"),
+            info.get("DeployParams(M)"), info.get("DeployFLOPs(G)"),
             info.get("ReparamErr"), info.get("RepMode"),
         ]
         ws.append(row)
@@ -132,10 +136,11 @@ def main():
     for r in range(2, ws.max_row + 1):
         for col in ["E", "F", "G", "H", "I", "J"]:
             ws[f"{col}{r}"].number_format = "0.00"
-        ws[f"K{r}"].number_format = "0.00"      # Params(M)
-        ws[f"L{r}"].number_format = "0.00"      # Trainable(M)
-        ws[f"M{r}"].number_format = "0.00"      # FLOPs(G)
-        ws[f"N{r}"].number_format = "0.00E+00"  # ReparamErr
+        ws[f"K{r}"].number_format = "0.00"      # TrainGraphParams(M)
+        ws[f"L{r}"].number_format = "0.00"      # TrainableParams(M)
+        ws[f"M{r}"].number_format = "0.00"      # DeployParams(M)
+        ws[f"N{r}"].number_format = "0.00"      # DeployFLOPs(G)
+        ws[f"O{r}"].number_format = "0.00E+00"  # ReparamErr
 
     # 整表自动筛选（按数据集/实验/run/tag 均可筛）
     ws.auto_filter.ref = ws.dimensions
@@ -147,7 +152,7 @@ def main():
     widths = {
         "A": 10, "B": 8, "C": 14, "D": 16,
         "E": 10, "F": 10, "G": 8, "H": 8, "I": 8, "J": 8,
-        "K": 10, "L": 12, "M": 10, "N": 12, "O": 10,
+        "K": 16, "L": 14, "M": 14, "N": 12, "O": 12, "P": 10,
     }
     for col, w in widths.items():
         ws.column_dimensions[col].width = w
