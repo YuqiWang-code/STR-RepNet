@@ -131,12 +131,23 @@ Run2 在 Run1 基础上做了两处改造（部署图/参数/FLOPs 完全不变�
 - 结论：IBAS 是「中性」机制（持平锚点、优于 Run3），未带来判据级提升；当前最佳仍为 Run2 full_last2。WHU/SYSU 仍反超 baseline（+0.08 / +0.25）。
 - 设计文档：[`docs/temporary/STR-RepNet_Run4_IBAS_训练期内侧边界辅助监督方案.md`](docs/temporary/STR-RepNet_Run4_IBAS_训练期内侧边界辅助监督方案.md)。
 
-## 实验结果（Run5：回退 Run2 + BOTR，进行中）
+## 实验结果（Run5：回退 Run2 + BOTR，已完成）
 
 - **代码回退**：活跃方法主路径恢复 Run2 版本（移除 Edge-Basis/IBAS 活跃代码；历史记录保留）；P0 修复 FP64 folding（组合全程 float64、最后一次性 cast FP32）；P2 拆分 train/deploy 参数统计。
 - **主方案 BOTR**（Bi-Order Temporal Re-parameterization）：TAR 各尺度加零初始化 reverse-concat `W_r[Q,P]` 训练分支（独立 BN），部署时通道置换吸收回单个 temporal 1×1 → **+0 部署参数/FLOPs**（`--use_botr`）。
-- 最小消融（第一阶段 LEVIR × 3，GPU1 并行）：**D0** `encoder_train=full` 上界诊断 / **C1** `temporal_swap_prob=0.5` 必要对照 / **M1** `use_botr=1` 主实验；A0 = Run2 full_last2 已有锚点（不重跑）。
-- 判据（LEVIR 锚点 F1=0.9144）：M1 **PASS** 需 F1≥0.9175 且 Recall≥0.9065 且 Precision≥0.9230 且 IoU≥0.8475；F1<0.9159 → **FAIL** 停止 BOTR；M1 过线后才扩 WHU→SYSU→CDD（脚本已预写）。
+- 最小消融（LEVIR × 3）：**D0** `encoder_train=full` 上界诊断 / **C1** `temporal_swap_prob=0.5` 必要对照 / **M1** `use_botr=1` 主实验；A0 = Run2 full_last2 锚点（不重跑）。
+
+| 实验 | F1 | Recall | Precision | IoU | ΔF1 vs 锚点 0.9144 |
+|---|---|---|---|---|---|
+| C1_swap_only | 0.9143 | 0.9043 | 0.9245 | 0.8421 | -0.01pp |
+| M1_BOTR | 0.9144 | 0.9046 | 0.9244 | 0.8423 | ±0.00 |
+| D0_full_encoder | **0.9168** | 0.9056 | 0.9282 | 0.8463 | **+0.24pp** |
+
+- **M1/BOTR 判据 FAIL**（F1=0.9144 < 失败线 0.9159，恰在锚点线上）→ 按预注册协议停止 BOTR，不扩四数据集。
+- **归因**：M1 − C1 = +0.0001pp → BOTR 未提供超出普通 swap 增强的收益；C1 本身也 ≈ 锚点（swap 增强同样中性）。
+- **D0/full-encoder**：+0.24pp（中性偏正，未达 +0.30pp「主要瓶颈」线）；是 Run5 三者最佳、也是当前 LEVIR 最佳（仍低于 HAM-CD baseline 0.9211 约 -0.43pp）。
+- 部署不变：三组均 28.829M / 12.6062G；fold 误差 1.4~1.6e-5，argmax 分歧 0。
+- 结论：Run5 三个假设（encoder 适配 / 数据级时序对称 / 结构级时序重参数化）均无判据级突破 → 下一轮按文档预设进入「高分辨率/小目标信息保真 + budget-neutral decoder channel allocation」，不再给 TAR/edge/loss 叠模块；`encoder_train=full` 可作为训练协议候选（零部署增量）。
 - 设计文档：[`docs/temporary/STR-RepNet_Run5_回退Run2与BOTR最小消融实验方案.md`](docs/temporary/STR-RepNet_Run5_回退Run2与BOTR最小消融实验方案.md)。
 
 ## 参考文献
