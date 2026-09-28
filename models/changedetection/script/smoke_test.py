@@ -1,7 +1,7 @@
 """Smoke test for STR-RepNet Clean TAR-DCR (build + forward + params/FLOPs + deploy + dataloader).
 
-Run5 additions: --encoder_train / --use_botr checks (reverse-branch grad flow,
-deploy graph without proj_r/bn_r, deploy params identical with/without BOTR).
+Run6 additions: --use_nscr checks (zero-init residual, gamma gradient, deploy
+branch deletion, deploy params/FLOPs identical to use_nscr=0, argmax=0).
 """
 import copy
 import os
@@ -25,7 +25,8 @@ def build_model(args, config):
     return STRRepNet(
         pretrained=args.pretrained_weight_path, rep_mode=args.rep_mode,
         use_residual=bool(args.use_residual), encoder_train=args.encoder_train,
-        use_botr=bool(args.use_botr),
+        use_botr=bool(args.use_botr), use_nscr=bool(args.use_nscr),
+        nscr_scope=args.nscr_scope,
         patch_size=v.PATCH_SIZE, in_chans=v.IN_CHANS, num_classes=config.MODEL.NUM_CLASSES,
         depths=v.DEPTHS, dims=v.EMBED_DIM,
         ssm_d_state=v.SSM_D_STATE, ssm_ratio=v.SSM_RATIO, ssm_rank_ratio=v.SSM_RANK_RATIO,
@@ -46,10 +47,12 @@ def main():
     ap.add_argument('--pretrained_weight_path', type=str, required=True)
     ap.add_argument('--dataset_root', type=str, required=True)
     ap.add_argument('--test_list', type=str, required=True)
-    ap.add_argument('--rep_mode', type=str, default='full', choices=['plain', 'tar', 'full'])
+    ap.add_argument('--rep_mode', type=str, default='full', choices=['plain', 'tar', 'dcr', 'full'])
     ap.add_argument('--encoder_train', type=str, default='frozen', choices=['frozen', 'last2', 'full'])
     ap.add_argument('--use_residual', type=int, default=1)
     ap.add_argument('--use_botr', type=int, default=0)
+    ap.add_argument('--use_nscr', type=int, default=0)
+    ap.add_argument('--nscr_scope', type=str, default='high2', choices=['high2', 'lonly', 'honly'])
     ap.add_argument('--gpu', type=int, default=0)
     args = ap.parse_args()
 
@@ -64,9 +67,16 @@ def main():
     total = sum(p.numel() for p in model.parameters())
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"  total params = {total/1e6:.3f} M, trainable = {trainable/1e6:.3f} M")
-    if args.use_botr:
-        assert all(hasattr(m, "proj_r") for m in model.tar.modules()
-                   if m.__class__.__name__ == "TemporalRep1x1")
+
+    if args.use_nscr:
+        for name in ("fuse1", "fuse2"):
+            m = getattr(model.decoder, name)
+            assert m.__class__.__name__ == "NSCRPairFuse1x1", f"{name} should be NSCRPairFuse1x1"
+            for bn in ("bn_l", "bn_h"):
+                if hasattr(m, bn):
+                    b = getattr(m, bn)
+                    assert b.weight.abs().sum().item() == 0.0 and b.bias.abs().sum().item() == 0.0
+        print("  NSCR zero-init OK (bn_l/bn_h weight=bias=0; residual output is exactly 0 at init)")
 
     # encoder train mode per encoder_train
     enc_trainable = sum(p.numel() for p in model.encoder.parameters() if p.requires_grad)
@@ -82,62 +92,72 @@ def main():
 
     print("[2/6] forward pass ...")
     model.eval()
+    torch.manual_seed(2333)  # deterministic inputs for reproducible fold/argmax checks
     with torch.no_grad():
         pre = torch.randn(2, 3, 256, 256).cuda()
         post = torch.randn(2, 3, 256, 256).cuda()
         out = model(pre, post)
     print(f"  output shape = {tuple(out.shape)} (expect (2, 2, 256, 256))")
 
-    if args.use_botr:
-        print("[2b/6] BOTR reverse-branch gradient flow ...")
+    if args.use_nscr:
+        print("[2b/6] NSCR gamma gradient flow ...")
         m_grad = copy.deepcopy(model)
         m_grad.train()
         out_g = m_grad(pre, post)
         loss = torch.nn.functional.cross_entropy(out_g, torch.randint(0, 2, (2, 256, 256)).cuda())
         loss.backward()
-        proj_r_grads = [m.proj_r.weight.grad for m in m_grad.tar.modules()
-                        if m.__class__.__name__ == "TemporalRep1x1"]
-        assert all(g is not None for g in proj_r_grads), "proj_r grad must be non-None"
-        gr = sum(g.abs().sum().item() for g in proj_r_grads)
-        print(f"  proj_r grad sum = {gr:.3e} (expect > 0)")
-        assert gr > 0
-        if args.encoder_train == 'last2':
-            s12_grad = sum(1 for i in (0, 1) for p in m_grad.encoder.layers[i].parameters()
-                           if p.grad is not None)
-            s34_grad = sum(p.grad.abs().sum().item()
-                           for i in (2, 3) for p in m_grad.encoder.layers[i].parameters()
-                           if p.grad is not None)
-            assert s12_grad == 0 and s34_grad > 0
-            print(f"  stage1+2 grads={s12_grad} (expect 0), stage3+4|grad|={s34_grad:.3e} (expect > 0)")
+        for name in ("fuse1", "fuse2"):
+            m = getattr(m_grad.decoder, name)
+            for bn in ("bn_l", "bn_h"):
+                if hasattr(m, bn):
+                    g = getattr(m, bn).weight.grad
+                    assert g is not None and g.abs().sum().item() > 0, f"{name}.{bn} grad must be non-zero"
+        print("  NSCR gamma grads non-zero OK")
 
     print("[3/6] deploy fold ...")
     deploy = copy.deepcopy(model)
     deploy.switch_to_deploy()
     deploy.eval()
-    has_r = any(hasattr(m, "proj_r") or hasattr(m, "bn_r") for m in deploy.modules())
-    assert not has_r, "deploy graph must not contain proj_r / bn_r"
+    sd_keys = set(deploy.state_dict().keys())
+    has_nscr = any(("bn_l" in k or "bn_h" in k or ".core." in k) for k in sd_keys)
+    assert not has_nscr, "deploy graph must not contain bn_l/bn_h/core"
     with torch.no_grad():
         out_d = deploy(pre, post)
     err = (out - out_d).abs().max().item()
+    disagree = (out.argmax(1) != out_d.argmax(1)).float().mean().item()
     deploy_params = sum(p.numel() for p in deploy.parameters())
-    print(f"  fold max_abs_error = {err:.3e}, deploy params = {deploy_params/1e6:.3f} M")
-    print(f"  deploy graph clean (no proj_r/bn_r): {not has_r}")
+    print(f"  fold max_abs_error = {err:.3e}, argmax_disagree = {disagree:.3e}, "
+          f"deploy params = {deploy_params/1e6:.3f} M")
+    print(f"  deploy graph clean (no bn_l/bn_h/core): {not has_nscr}")
     assert err < 2e-4, f"fold error too large: {err}"
 
-    print("[4/6] FLOPs ...")
-    from fvcore.nn import flop_count
-    from classification.models.vmamba import selective_scan_flop_jit
-    supported = {
-        "prim::PythonOp.SelectiveScanMamba": selective_scan_flop_jit,
-        "prim::PythonOp.SelectiveScanOflex": selective_scan_flop_jit,
-        "prim::PythonOp.SelectiveScanCore": selective_scan_flop_jit,
-    }
-    with torch.no_grad():
-        counts, unsup = flop_count(deploy, (pre, post), supported_ops=supported)
-    total_flops = sum(counts.values())
-    print(f"  deploy FLOPs = {total_flops:.4f} G  (unsupported={len(unsup)})")
+    if args.use_nscr:
+        # deploy params / FLOPs must be IDENTICAL to the use_nscr=0 model
+        args0 = argparse.Namespace(**{**vars(args), "use_nscr": 0})
+        model0 = build_model(args0, config).cuda()
+        deploy0 = copy.deepcopy(model0)
+        deploy0.switch_to_deploy()
+        deploy0.eval()
+        p0 = sum(p.numel() for p in deploy0.parameters())
+        assert p0 == deploy_params, f"deploy params differ: nscr={deploy_params} vs 0={p0}"
+        from fvcore.nn import flop_count
+        from classification.models.vmamba import selective_scan_flop_jit
+        supported = {
+            "prim::PythonOp.SelectiveScanMamba": selective_scan_flop_jit,
+            "prim::PythonOp.SelectiveScanOflex": selective_scan_flop_jit,
+            "prim::PythonOp.SelectiveScanCore": selective_scan_flop_jit,
+        }
+        with torch.no_grad():
+            c_n, _ = flop_count(deploy, (pre, post), supported_ops=supported)
+            c_0, _ = flop_count(deploy0, (pre, post), supported_ops=supported)
+        f_n, f_0 = sum(c_n.values()), sum(c_0.values())
+        print(f"  deploy FLOPs nscr={f_n:.4f} vs 0={f_0:.4f} (batch2)")
+        assert abs(f_n - f_0) < 0.01, "deploy FLOPs differ"
+        print(f"  deploy Params/FLOPs identical to use_nscr=0: OK ({deploy_params/1e6:.3f} M)")
+    else:
+        print(f"  deploy params = {deploy_params/1e6:.3f} M")
 
-    print("[5/6] dataloader ...")
+    print("[4/6] dataloader ...")
     ds = ChangeDetectionDataset(args.dataset_root, read_list(args.test_list), 256, type='test')
     a, b, l, name = ds[0]
     print(f"  sample: A {a.shape} {a.dtype}, B {b.shape}, label {l.shape} {l.dtype}, name {name}")

@@ -37,6 +37,7 @@ Lightweight Spatial-Temporal Structural Re-parameterization Network for Remote S
 - **DCR**（Decoder-wide Compositional Re-parameterization）：RepDW3 / RepPW1x1 / RepPairFuse1x1，整个 decoder 的可折叠算子图
 - **Edge-Basis**（Run3 迭代，已验证未达判据、未纳入主方法）：在 `DCRDecoder.refine.dw` 增加可折叠的 Sobel-X/Y 结构边缘基分支，部署仍折叠为单个 DW3×3（`--use_edge`）
 - **IBAS**（Run4 迭代，辅助训练机制）：最终 decoder feature 上挂 161 参数零初始化训练期边界头，GT 内侧边界（`B⁺=Y−Erode3×3(Y)`）在线生成，`BCE+Dice` 加权 0.1，`switch_to_deploy` 整支删除（`--use_boundary_aux`，部署 +0 参数/FLOPs）
+- **NSCR-Fuse**（Run6 迭代，主线候选）：`DCRDecoder` 的 fuse1+fuse2 加零初始化原生尺度 BN 分支（`BN_L(L)` + `U(BN_H(H))`），利用逐通道仿射与 bilinear 插值可交换性，部署时吸收回原 cross-scale 1×1（`--use_nscr`，部署 +0 参数/FLOPs）
 
 - 模型入口：`models/changedetection/models/STRRepNet.py`（`STRRepNet`）
 - 核心文件：`reparam.py`（代数折叠原语）、`tar.py`（二时相 bridge）、`dcr_decoder.py`（多尺度解码器）
@@ -149,6 +150,14 @@ Run2 在 Run1 基础上做了两处改造（部署图/参数/FLOPs 完全不变�
 - 部署不变：三组均 28.829M / 12.6062G；fold 误差 1.4~1.6e-5，argmax 分歧 0。
 - 结论：Run5 三个假设（encoder 适配 / 数据级时序对称 / 结构级时序重参数化）均无判据级突破 → 下一轮按文档预设进入「高分辨率/小目标信息保真 + budget-neutral decoder channel allocation」，不再给 TAR/edge/loss 叠模块；`encoder_train=full` 可作为训练协议候选（零部署增量）。
 - 设计文档：[`docs/temporary/STR-RepNet_Run5_回退Run2与BOTR最小消融实验方案.md`](docs/temporary/STR-RepNet_Run5_回退Run2与BOTR最小消融实验方案.md)。
+
+## 实验结果（Run6：NSCR-Fuse，进行中）
+
+- **主方案 NSCR-Fuse**（Native-Scale Commutative Re-parameterized Fusion）：在 DCR 的 `fuse1+fuse2` 各加零初始化原生尺度 BN 分支（`BN_L(L)` + `U(BN_H(H))`），利用「逐通道仿射 × bilinear 插值可交换」在部署时精确吸收回原 cross-scale 1×1 → **+0 部署参数/FLOPs**（`--use_nscr`）。
+- 最小消融（第一阶段只跑 LEVIR，GPU0 整卡）：**M1_NSCR_high2**（主实验，last2）；M1 过线后补 C1_Lonly / C2_Honly 归因、M2_NSCR_fullenc 叠加测试与 WHU→SYSU→CDD（脚本已预写）。
+- 判据（LEVIR 锚点 F1=0.9144）：**PASS** 需 F1≥0.9175 且 IoU≥0.8475 且 Precision≥0.9230；F1<0.9159 或 Precision<0.9220 → **FAIL** 停止 NSCR；失败预案转 PBRU（若尺度诊断阳性）。
+- 诊断：`analyse/levir_error_profile.py`（尺寸分层 FN + 尺度敏感性，零训练，Run2 vs D0）。
+- 设计文档：[`docs/temporary/STR-RepNet_Run6_下一步改进方向与实验设计_NSCR-Fuse.md`](docs/temporary/STR-RepNet_Run6_下一步改进方向与实验设计_NSCR-Fuse.md)。
 
 ## 参考文献
 

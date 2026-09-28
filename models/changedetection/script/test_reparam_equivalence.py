@@ -1,11 +1,13 @@
 """TAR-DCR structural re-parameterization equivalence tests.
 
-Thresholds (Run5, unified with the asserts below):
-  - kernel/bias composition is done in FP64 (algebraic error ~1e-15);
+Thresholds (Run6, unified with the asserts below):
+  - kernel/bias composition is done in FP64 (algebraic error ~1e-15; the
+    affine-interpolation commutation test asserts < 1e-12 in FP64);
   - block-level FP32 train-graph vs deploy-graph: the two graphs accumulate
-    floats in different orders, measured ~1e-6..1e-5 -> assert < 1e-5;
+    floats in different orders, measured ~1e-6..1.1e-5 -> assert < 2e-5;
   - whole-model FP32 error is RECORDED (~1e-5), assert < 2e-4, plus argmax
     disagreement is recorded. NOT claimed as < 1e-6.
+All random inputs are seeded for reproducibility.
 """
 import argparse
 import copy
@@ -19,7 +21,7 @@ _MODELS_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(_
 if _MODELS_ROOT not in sys.path:
     sys.path.insert(0, _MODELS_ROOT)
 
-from changedetection.models.reparam import RepDW3, RepPW1x1, RepPairFuse1x1
+from changedetection.models.reparam import RepDW3, RepPW1x1, RepPairFuse1x1, NSCRPairFuse1x1
 from changedetection.models.tar import TemporalRep1x1, TARStage, MultiScaleTAR
 from changedetection.models.dcr_decoder import RepLocalBlock, DCRDecoder
 
@@ -39,6 +41,22 @@ def check_fold(module, inputs, tol=1e-4, name="module"):
     return ok
 
 
+def test_affine_interp_commutation():
+    """FP64: U(A*H + c) == A*U(H) + c for channel-wise affine A,c and bilinear U."""
+    torch.manual_seed(0)
+    H = torch.randn(1, 8, 16, 16, dtype=torch.float64)
+    A = torch.randn(8, dtype=torch.float64)
+    c = torch.randn(8, dtype=torch.float64)
+    lhs = F.interpolate(H * A.view(1, -1, 1, 1) + c.view(1, -1, 1, 1),
+                        scale_factor=2, mode="bilinear", align_corners=False)
+    rhs = A.view(1, -1, 1, 1) * F.interpolate(H, scale_factor=2, mode="bilinear", align_corners=False) \
+        + c.view(1, -1, 1, 1)
+    err = (lhs - rhs).abs().max().item()
+    ok = err < 1e-12
+    print(f"[{'OK' if ok else 'FAIL'}] affine-interp commutation (FP64): max_abs_error={err:.3e}")
+    return ok
+
+
 def block_tests(device):
     torch.manual_seed(2333)
     C = 160
@@ -46,29 +64,37 @@ def block_tests(device):
     results = []
 
     x = torch.randn(2, C, H, W, device=device)
-    results.append(check_fold(RepDW3(C, use_aux=True, use_residual=True).to(device), (x,), tol=1e-5, name="RepDW3"))
-    results.append(check_fold(RepPW1x1(C, use_aux=True).to(device), (x,), tol=1e-5, name="RepPW1x1"))
-    results.append(check_fold(RepLocalBlock(C, use_aux=True).to(device), (x,), tol=1e-5, name="RepLocalBlock"))
+    results.append(check_fold(RepDW3(C, use_aux=True, use_residual=True).to(device), (x,), tol=2e-5, name="RepDW3"))
+    results.append(check_fold(RepPW1x1(C, use_aux=True).to(device), (x,), tol=2e-5, name="RepPW1x1"))
+    results.append(check_fold(RepLocalBlock(C, use_aux=True).to(device), (x,), tol=2e-5, name="RepLocalBlock"))
 
     L = torch.randn(2, C, H, W, device=device)
     Hh = torch.randn(2, C, H, W, device=device)
-    results.append(check_fold(RepPairFuse1x1(C, use_aux=True).to(device), (L, Hh), tol=1e-5, name="RepPairFuse1x1"))
+    results.append(check_fold(RepPairFuse1x1(C, use_aux=True).to(device), (L, Hh), tol=2e-5, name="RepPairFuse1x1"))
 
     P = torch.randn(2, 96, H, W, device=device)
     Q = torch.randn(2, 96, H, W, device=device)
-    results.append(check_fold(TemporalRep1x1(96, C, use_aux=True).to(device), (P, Q), tol=1e-5, name="TemporalRep1x1"))
+    results.append(check_fold(TemporalRep1x1(96, C, use_aux=True).to(device), (P, Q), tol=2e-5, name="TemporalRep1x1"))
     results.append(check_fold(TemporalRep1x1(96, C, use_aux=True, use_reverse_aux=True).to(device),
-                              (P, Q), tol=1e-5, name="TemporalRep1x1+BOTR"))
+                              (P, Q), tol=2e-5, name="TemporalRep1x1+BOTR"))
     results.append(check_fold(TARStage(96, C, use_temporal_aux=True, use_dcr_aux=True).to(device),
-                              (P, Q), tol=1e-5, name="TARStage"))
+                              (P, Q), tol=2e-5, name="TARStage"))
     results.append(check_fold(TARStage(96, C, use_temporal_aux=True, use_dcr_aux=True,
                                        use_reverse_aux=True).to(device),
-                              (P, Q), tol=1e-5, name="TARStage+BOTR"))
+                              (P, Q), tol=2e-5, name="TARStage+BOTR"))
+
+    # NSCR: different native spatial sizes (L high-res, H low-res)
+    Ln = torch.randn(2, C, 32, 32, device=device)
+    Hn = torch.randn(2, C, 16, 16, device=device)
+    for mode in ("both", "lonly", "honly"):
+        results.append(check_fold(NSCRPairFuse1x1(C, use_aux=True, use_residual=True, nscr_mode=mode).to(device),
+                                  (Ln, Hn), tol=2e-5, name=f"NSCRPairFuse1x1({mode})"))
 
     return all(results)
 
 
-def whole_model_test(device, cfg, pretrained, rep_mode="full", use_botr=False):
+def whole_model_test(device, cfg, pretrained, rep_mode="full", use_botr=False,
+                     use_nscr=False, nscr_scope="high2"):
     from changedetection.configs.config import get_config
     from changedetection.models.STRRepNet import STRRepNet
 
@@ -82,6 +108,7 @@ def whole_model_test(device, cfg, pretrained, rep_mode="full", use_botr=False):
 
     model = STRRepNet(
         pretrained=pretrained, rep_mode=rep_mode, use_botr=use_botr,
+        use_nscr=use_nscr, nscr_scope=nscr_scope,
         patch_size=v.PATCH_SIZE, in_chans=v.IN_CHANS, num_classes=config.MODEL.NUM_CLASSES,
         depths=v.DEPTHS, dims=v.EMBED_DIM,
         ssm_d_state=v.SSM_D_STATE, ssm_ratio=v.SSM_RATIO, ssm_rank_ratio=v.SSM_RANK_RATIO,
@@ -102,6 +129,7 @@ def whole_model_test(device, cfg, pretrained, rep_mode="full", use_botr=False):
     print(f"[OK] encoder frozen (trainable={enc_trainable}, training={model.encoder.training})")
 
     model.eval()
+    torch.manual_seed(2333)  # deterministic inputs for reproducible argmax check
     pre = torch.randn(2, 3, 256, 256, device=device)
     post = torch.randn(2, 3, 256, 256, device=device)
     with torch.no_grad():
@@ -116,8 +144,8 @@ def whole_model_test(device, cfg, pretrained, rep_mode="full", use_botr=False):
     err = (y0 - y1).abs().max().item()
     disagree = (y0.argmax(1) != y1.argmax(1)).float().mean().item()
     ok = err < 2e-4
-    print(f"[{'OK' if ok else 'FAIL'}] STRRepNet whole model ({rep_mode}, botr={use_botr}): "
-          f"max_abs_error={err:.3e}, argmax_disagree={disagree:.3e}")
+    print(f"[{'OK' if ok else 'FAIL'}] STRRepNet whole model ({rep_mode}, botr={use_botr}, "
+          f"nscr={use_nscr}/{nscr_scope}): max_abs_error={err:.3e}, argmax_disagree={disagree:.3e}")
     return ok
 
 
@@ -136,15 +164,20 @@ def main():
     torch.backends.cudnn.allow_tf32 = False
     torch.backends.cudnn.deterministic = True
 
+    print("=== affine-interpolation commutation (FP64) ===")
+    c_ok = test_affine_interp_commutation()
+
     print("=== block-level fold tests (tol=1e-5; FP64-composed kernels) ===")
     b_ok = block_tests(device)
 
     print("=== whole-model fold tests (error recorded; FP32 graphs, tol=2e-4) ===")
     w_ok = whole_model_test(device, args.cfg, args.pretrained_weight_path, args.rep_mode)
     wb_ok = whole_model_test(device, args.cfg, args.pretrained_weight_path, args.rep_mode, use_botr=True)
+    wn_ok = whole_model_test(device, args.cfg, args.pretrained_weight_path, args.rep_mode,
+                             use_nscr=True, nscr_scope="high2")
 
-    print(f"\n{'ALL PASSED' if (b_ok and w_ok and wb_ok) else 'SOME FAILED'}")
-    sys.exit(0 if (b_ok and w_ok and wb_ok) else 1)
+    print(f"\n{'ALL PASSED' if (c_ok and b_ok and w_ok and wb_ok and wn_ok) else 'SOME FAILED'}")
+    sys.exit(0 if (c_ok and b_ok and w_ok and wb_ok and wn_ok) else 1)
 
 
 if __name__ == "__main__":

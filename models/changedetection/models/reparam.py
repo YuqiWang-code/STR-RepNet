@@ -282,3 +282,106 @@ def switch_module_to_deploy(module):
         if m is not module and hasattr(m, "switch_to_deploy"):
             m.switch_to_deploy()
     return module
+
+
+def fold_identity_bn(bn, channels):
+    """Fold an eval-mode BN on an identity path into (A, c), both FP64.
+
+    A: (channels, channels, 1, 1) diagonal 1x1 kernel (gamma/sqrt(var+eps));
+    c: (channels,) bias (beta - A*mu).
+    Used by NSCR-Fuse (Run6).
+    """
+    eps = bn.eps if bn.eps is not None else 1e-5
+    gamma = bn.weight.detach().double()
+    beta = bn.bias.detach().double()
+    mu = bn.running_mean.detach().double()
+    var = bn.running_var.detach().double()
+    t = gamma / torch.sqrt(var + eps)
+    A = torch.diag(t).view(channels, channels, 1, 1)
+    c = beta - t * mu
+    return A, c
+
+
+class NSCRPairFuse1x1(nn.Module):
+    """Run6 NSCR-Fuse: native-scale commutative re-parameterized cross-scale fusion.
+
+    Wraps a RepPairFuse1x1 core. Training adds zero-init native-scale BN branches:
+        y = core(L, U(H)) + BN_L(L) + U(BN_H(H))
+    where U is bilinear interpolation (H is received at its NATIVE low resolution
+    and upsampled inside this module). At deploy, the affine-interpolation
+    commutation U(A H + c) = A U(H) + c absorbs both branches into the core
+    1x1's L/H input halves, so the deploy graph stays one bilinear + one 1x1
+    (+0 params/FLOPs). All composition stays FP64; one FP32 cast at the end.
+
+    nscr_mode: "none" | "both" | "lonly" | "honly".
+    """
+
+    def __init__(self, channels, use_aux=True, use_residual=True, nscr_mode="none", deploy=False):
+        super().__init__()
+        self.channels = channels
+        self.use_aux = use_aux
+        self.use_residual = use_residual
+        self.nscr_mode = nscr_mode
+        self.deploy = deploy
+        if deploy:
+            self.fused = nn.Conv2d(2 * channels, channels, 1, bias=True)
+        else:
+            self.core = RepPairFuse1x1(channels, use_aux=use_aux, use_residual=use_residual, deploy=False)
+            if nscr_mode in ("both", "lonly"):
+                self.bn_l = nn.BatchNorm2d(channels)
+                nn.init.zeros_(self.bn_l.weight)
+                nn.init.zeros_(self.bn_l.bias)
+            if nscr_mode in ("both", "honly"):
+                self.bn_h = nn.BatchNorm2d(channels)
+                nn.init.zeros_(self.bn_h.weight)
+                nn.init.zeros_(self.bn_h.bias)
+
+    def forward(self, L, H):
+        up_h = F.interpolate(H, size=L.shape[-2:], mode="bilinear", align_corners=False)
+        if self.deploy:
+            return self.fused(torch.cat([L, up_h], dim=1))
+        y = self.core(L, up_h)
+        if self.nscr_mode in ("both", "lonly"):
+            y = y + self.bn_l(L)
+        if self.nscr_mode in ("both", "honly"):
+            y = y + F.interpolate(self.bn_h(H), size=L.shape[-2:], mode="bilinear", align_corners=False)
+        return y
+
+    def get_equivalent_kernel_bias(self):
+        # FP64 composition. NOTE: never call core.switch_to_deploy() here — that
+        # would cast FP32 early and break the P0 one-time-cast rule.
+        C = self.channels
+        W_core, b_core = self.core.get_equivalent_kernel_bias()  # (C, 2C, 1, 1) FP64
+        W_L = W_core[:, :C]
+        W_H = W_core[:, C:]
+        b = b_core
+        if self.nscr_mode in ("both", "lonly"):
+            A_l, c_l = fold_identity_bn(self.bn_l, C)
+            W_L = W_L + A_l
+            b = b + c_l
+        if self.nscr_mode in ("both", "honly"):
+            A_h, c_h = fold_identity_bn(self.bn_h, C)
+            W_H = W_H + A_h
+            b = b + c_h
+        return torch.cat([W_L, W_H], dim=1), b
+
+    def branch_stats(self):
+        s = {"core": self.core.branch_stats()}
+        if self.nscr_mode in ("both", "lonly"):
+            s["nscr_l_gamma"] = self.bn_l.weight.norm().item()
+        if self.nscr_mode in ("both", "honly"):
+            s["nscr_h_gamma"] = self.bn_h.weight.norm().item()
+        return s
+
+    def switch_to_deploy(self):
+        if self.deploy:
+            return self
+        kernel, bias = self.get_equivalent_kernel_bias()
+        self.fused = nn.Conv2d(2 * self.channels, self.channels, 1, bias=True)
+        self.fused.weight.data = kernel.float()
+        self.fused.bias.data = bias.float()
+        self.deploy = True
+        for name in ("core", "bn_l", "bn_h"):
+            if hasattr(self, name):
+                delattr(self, name)
+        return self

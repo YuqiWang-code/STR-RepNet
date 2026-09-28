@@ -118,6 +118,8 @@ class Trainer(object):
             use_residual=self.args.use_residual,
             encoder_train=self.args.encoder_train,
             use_botr=bool(self.args.use_botr),
+            use_nscr=bool(self.args.use_nscr),
+            nscr_scope=self.args.nscr_scope,
             patch_size=v.PATCH_SIZE,
             in_chans=v.IN_CHANS,
             num_classes=config.MODEL.NUM_CLASSES,
@@ -273,6 +275,16 @@ class Trainer(object):
         torch.backends.cudnn.deterministic = True
 
         self.model.eval()
+        # NSCR branch diagnostics (before folding; not used for checkpoint selection)
+        if self.args.use_nscr:
+            for name in ("fuse1", "fuse2"):
+                m = getattr(self.model.decoder, name, None)
+                st = getattr(m, "branch_stats", lambda: None)() or {}
+                if "nscr_l_gamma" in st:
+                    self.log(f"[NSCR-GAMMA-NORM] {name}/l={st['nscr_l_gamma']:.4e}")
+                if "nscr_h_gamma" in st:
+                    self.log(f"[NSCR-GAMMA-NORM] {name}/h={st['nscr_h_gamma']:.4e}")
+
         ref_pre = torch.randn(1, 3, self.args.crop_size, self.args.crop_size).cuda()
         ref_post = torch.randn(1, 3, self.args.crop_size, self.args.crop_size).cuda()
         with torch.no_grad():
@@ -301,6 +313,8 @@ class Trainer(object):
         self.log("[MODEL] STR-RepNet Clean TAR-DCR")
         self.log(f"[REP-MODE] {self.args.rep_mode}")
         self.log(f"[BOTR] {int(self.args.use_botr)}")
+        self.log(f"[NSCR] {int(self.args.use_nscr)}")
+        self.log(f"[NSCR-SCOPE] {self.args.nscr_scope}")
         self.log(f"[ENCODER-TRAIN] {self.args.encoder_train}")
         self.log(f"[TEMPORAL-SWAP-PROB] {self.args.temporal_swap_prob}")
         self.log(f"[TOTAL-TRAIN-GRAPH-PARAMS] {fmt_params(train_total)} M")
@@ -319,7 +333,7 @@ class Trainer(object):
 # -----------------------------------------------------------------------------
 def write_header(args, config, log):
     log("=" * 72)
-    log("STR-RepNet Clean TAR-DCR  |  train_scripts/TAR-DCR/Run1")
+    log("STR-RepNet Clean TAR-DCR  |  train_scripts/TAR-DCR")
     log("=" * 72)
     log("[CONFIG]")
     for k, v in vars(args).items():
@@ -330,7 +344,7 @@ def write_header(args, config, log):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="HAM-CD baseline training (Run1)")
+    parser = argparse.ArgumentParser(description="STR-RepNet (Clean TAR-DCR) training")
     parser.add_argument('--cfg', type=str, required=True)
     parser.add_argument('--opts', default=None, nargs='+')
     parser.add_argument('--dataset', type=str, required=True)
@@ -349,6 +363,8 @@ def main():
     parser.add_argument('--rep_mode', type=str, default='full', choices=['plain', 'tar', 'dcr', 'full'])
     parser.add_argument('--use_residual', type=int, default=1)
     parser.add_argument('--use_botr', type=int, default=0)
+    parser.add_argument('--use_nscr', type=int, default=0)
+    parser.add_argument('--nscr_scope', type=str, default='high2', choices=['high2', 'lonly', 'honly'])
     parser.add_argument('--encoder_train', type=str, default='frozen', choices=['frozen', 'last2', 'full'])
     parser.add_argument('--encoder_lr_ratio', type=float, default=0.1)
     parser.add_argument('--temporal_swap_prob', type=float, default=0.0)

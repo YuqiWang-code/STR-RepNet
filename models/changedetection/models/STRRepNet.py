@@ -16,6 +16,11 @@ use_residual : foldable clean residual `+ alpha*x` inside each linear op (BN-FR)
 use_botr : Bi-Order Temporal Re-parameterization (Run5). Adds a zero-init
     reverse-concat [Q,P] branch to every TAR scale; folded back into the single
     temporal 1x1 at deploy via channel permutation (+0 deploy Params/FLOPs).
+
+use_nscr : Native-Scale Commutative Re-parameterized Fusion (Run6). Adds
+    zero-init native-scale BN branches to DCR fuse1+fuse2, absorbed into the
+    existing cross-scale 1x1 at deploy via affine-interpolation commutation
+    (+0 deploy Params/FLOPs). nscr_scope in {"high2","lonly","honly"}.
 """
 import torch
 import torch.nn as nn
@@ -28,13 +33,16 @@ from changedetection.models.dcr_decoder import DCRDecoder
 
 class STRRepNet(nn.Module):
     def __init__(self, pretrained=None, rep_mode="full", dim=160, use_residual=True,
-                 encoder_train="frozen", use_botr=False, **encoder_kwargs):
+                 encoder_train="frozen", use_botr=False, use_nscr=False,
+                 nscr_scope="high2", **encoder_kwargs):
         super().__init__()
         self.rep_mode = rep_mode
         self.dim = dim
         self.use_residual = use_residual
         self.encoder_train = encoder_train
         self.use_botr = use_botr
+        self.use_nscr = use_nscr
+        self.nscr_scope = nscr_scope if use_nscr else "none"
 
         self.encoder = Backbone_VSSM(out_indices=(0, 1, 2, 3), pretrained=pretrained, **encoder_kwargs)
         self._setup_encoder_train()
@@ -47,7 +55,8 @@ class STRRepNet(nn.Module):
             use_temporal_aux=use_temporal_aux, use_dcr_aux=use_dcr_aux,
             use_residual=use_residual, use_reverse_aux=use_botr,
         )
-        self.decoder = DCRDecoder(dim=dim, use_aux=use_dcr_aux, use_residual=use_residual)
+        self.decoder = DCRDecoder(dim=dim, use_aux=use_dcr_aux, use_residual=use_residual,
+                                  nscr_scope=self.nscr_scope)
         self.head = nn.Conv2d(dim, 2, 1)
 
     def _setup_encoder_train(self):
