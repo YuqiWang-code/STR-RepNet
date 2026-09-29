@@ -50,8 +50,11 @@ bilinear×4），而非输入分辨率 / encoder。Run7 用结构重参数化给
 
 - 公共：`rep_mode=full / use_residual=1 / use_botr=0 / use_nscr=0 / temporal_swap_prob=0.0 /
   seed=2333 / 300 epoch / batch 16 / lr 1e-4 / lovasz 2.0`。
-- C0/C1/M1 的 WHU/SYSU/CDD 脚本已预写；**仅当 M1/LEVIR 系统 PASS 且 M1−C1 有可辨识
-  rep 增益后**，按 WHU→SYSU→CDD 顺序启动。
+- **GPU0 并行**：C0+M1 的 LEVIR 与 **WHU**（用户指令，GPU0 可容纳 4 job，每 job ~6.8G，
+  4 job 实测 27.2G/32.6G）均已启动；WHU 判据为 ΔF1 vs 0.9514（退化 >0.15pp 记为明显 FAIL，
+  doc §18：若 LEVIR 好而 WHU 明显 FAIL → LEVIR-specific 输出头效应）。
+- C0/C1/M1 的 SYSU/CDD 脚本已预写；**仅当 M1 系统 PASS 且 M1−C1 有可辨识
+  rep 增益后**，按 SYSU→CDD 顺序启动。
 
 ## 预注册判据（LEVIR）
 

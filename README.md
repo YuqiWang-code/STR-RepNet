@@ -177,7 +177,7 @@ Run2 在 Run1 基础上做了两处改造（部署图/参数/FLOPs 完全不变�
   - **机器预算搜索**（`analyse/search_pbru_budget.py`）：锚点 = Run2 部署图 = 28.828706 M / 12.6062 G；逐 D 下降搜索得 **D\*=158**（PBRU 部署 28.818618 M / 12.6055 G）。
   - **阶段判别力预检**（`analyse/levir_stage_discriminability.py`，Run2 LEVIR 锚点，200 对 test 前 100 拟合/后 100 held-out）：训练头 AUROC@64=0.9881 > d1 全协方差 LDA 上界 0.9766（headroom −0.0115）→ 冻结 Run2 解码器下 d1 无静态粗尺度线性空间；PBRU 假设是**训练期端到端学习的亚单元相位自由度**，由 C0/C1/M1 对照裁决。
   - 等价性验证全通过：冒烟（epoch-0 输出与 use_pbru=0 逐位一致、γ 梯度非零、部署 +0、fold 9.9e-05、argmax=0）；重参数化等价性 T0（相位基/PixelShuffle 通道序/相位展开，精确）+ T1（PBRUHead 折叠 1.4e-06、FP64 代数 2.2e-15）+ T2（全模型五图均 <2e-4、argmax 全 0）。
-- Phase 1（进行中，GPU0）：**C0_Bilinear_D158**（宽度控制）+ **M1_PBRU_D158** 同时训练 LEVIR（300 epoch）；C1_PixelShuffle_D158 在 M1 PASS/WEAK 后启动做 rep 归因。
+- Phase 1（进行中，GPU0 并行 4 job）：**C0_Bilinear_D158 + M1_PBRU_D158** × **LEVIR + WHU**（300 epoch）；C1_PixelShuffle_D158 在 M1 PASS/WEAK 后启动做 rep 归因。
 - 判据（LEVIR 锚点 F1=0.9144）：M1 PASS = F1≥0.9175 且 IoU≥0.8475 且 Precision≥0.9230 且预算/argmax 合格；FAIL = F1<0.9159 或 Precision<0.9220 → 停止 PBRU 不救机制。四数据集扩展需 M1 系统 PASS 且 M1−C1 有可辨识 rep 增益。
 - 设计文档：[`docs/temporary/STR-RepNet_Run7_PBRU_修改方案与实验设计.md`](docs/temporary/STR-RepNet_Run7_PBRU_修改方案与实验设计.md)；`train_scripts/TAR-DCR/Run7/README.md`。
 
