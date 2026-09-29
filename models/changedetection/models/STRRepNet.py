@@ -21,6 +21,14 @@ use_nscr : Native-Scale Commutative Re-parameterized Fusion (Run6). Adds
     zero-init native-scale BN branches to DCR fuse1+fuse2, absorbed into the
     existing cross-scale 1x1 at deploy via affine-interpolation commutation
     (+0 deploy Params/FLOPs). nscr_scope in {"high2","lonly","honly"}.
+
+head_mode in {"bilinear", "pixelshuffle"} (Run7):
+    bilinear    : head Conv2d(dim,2,1) at 1/4 scale + bilinear x4 (Run2-Run6 default)
+    pixelshuffle: PBRUHead projecting dim -> 2*r^2 with PixelShuffle(r) to full res.
+use_pbru : add the four zero-init phase-basis BN branches (coarse/u/v/uv) inside
+    PBRUHead at train time; folded analytically into the single 1x1 projection at
+    deploy (+0 deploy Params/FLOPs vs plain PixelShuffle, +0 vs Run2 after D* search).
+pbru_upscale : r of PixelShuffle (fixed 4; 64x64 -> 256x256).
 """
 import torch
 import torch.nn as nn
@@ -29,12 +37,14 @@ import torch.nn.functional as F
 from changedetection.models.Mamba_backbone import Backbone_VSSM
 from changedetection.models.tar import MultiScaleTAR
 from changedetection.models.dcr_decoder import DCRDecoder
+from changedetection.models.reparam import PBRUHead
 
 
 class STRRepNet(nn.Module):
     def __init__(self, pretrained=None, rep_mode="full", dim=160, use_residual=True,
                  encoder_train="frozen", use_botr=False, use_nscr=False,
-                 nscr_scope="high2", **encoder_kwargs):
+                 nscr_scope="high2", head_mode="bilinear", use_pbru=False,
+                 pbru_upscale=4, **encoder_kwargs):
         super().__init__()
         self.rep_mode = rep_mode
         self.dim = dim
@@ -43,6 +53,9 @@ class STRRepNet(nn.Module):
         self.use_botr = use_botr
         self.use_nscr = use_nscr
         self.nscr_scope = nscr_scope if use_nscr else "none"
+        self.head_mode = head_mode
+        self.use_pbru = use_pbru
+        self.pbru_upscale = int(pbru_upscale)
 
         self.encoder = Backbone_VSSM(out_indices=(0, 1, 2, 3), pretrained=pretrained, **encoder_kwargs)
         self._setup_encoder_train()
@@ -57,7 +70,11 @@ class STRRepNet(nn.Module):
         )
         self.decoder = DCRDecoder(dim=dim, use_aux=use_dcr_aux, use_residual=use_residual,
                                   nscr_scope=self.nscr_scope)
-        self.head = nn.Conv2d(dim, 2, 1)
+        if head_mode == "pixelshuffle":
+            self.head = PBRUHead(dim, num_classes=2, upscale=self.pbru_upscale,
+                                 use_phase_rep=use_pbru)
+        else:
+            self.head = nn.Conv2d(dim, 2, 1)
 
     def _setup_encoder_train(self):
         for p in self.encoder.parameters():
@@ -85,7 +102,8 @@ class STRRepNet(nn.Module):
         feats = self.tar(pre_feats, post_feats)
         x = self.decoder(feats)
         logits = self.head(x)
-        logits = F.interpolate(logits, size=pre.shape[-2:], mode="bilinear", align_corners=False)
+        if self.head_mode != "pixelshuffle":
+            logits = F.interpolate(logits, size=pre.shape[-2:], mode="bilinear", align_corners=False)
         return logits
 
     def train(self, mode=True):
@@ -98,4 +116,6 @@ class STRRepNet(nn.Module):
     def switch_to_deploy(self):
         self.tar.switch_to_deploy()
         self.decoder.switch_to_deploy()
+        if isinstance(self.head, PBRUHead):
+            self.head.switch_to_deploy()
         return self

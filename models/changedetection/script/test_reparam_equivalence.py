@@ -8,6 +8,15 @@ Thresholds (Run6, unified with the asserts below):
   - whole-model FP32 error is RECORDED (~1e-5), assert < 2e-4, plus argmax
     disagreement is recorded. NOT claimed as < 1e-6.
 All random inputs are seeded for reproducibility.
+
+Run7 additions (PBRU):
+  - T0: phase-basis phi constants + PyTorch PixelShuffle one-hot channel
+    ordering + the c-major phase-expansion reshape convention (exact);
+  - T1: PBRUHead train->deploy fold (FP32, tol=2e-5) with NON-TRIVIAL weights
+    (zero-init by design, perturbed to TRAINED-HEAD magnitudes via
+    perturb_pbru_head: conv std 0.05, BN gamma std 0.5), plus an FP64
+    algebraic check of get_equivalent_kernel_bias against a manual expansion;
+  - T2: whole-model fold with head_mode="pixelshuffle" (use_pbru 0/1).
 """
 import argparse
 import copy
@@ -21,7 +30,8 @@ _MODELS_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(_
 if _MODELS_ROOT not in sys.path:
     sys.path.insert(0, _MODELS_ROOT)
 
-from changedetection.models.reparam import RepDW3, RepPW1x1, RepPairFuse1x1, NSCRPairFuse1x1
+from changedetection.models.reparam import (RepDW3, RepPW1x1, RepPairFuse1x1, NSCRPairFuse1x1,
+                                            PBRUHead, build_phase_basis, fold_conv_bn)
 from changedetection.models.tar import TemporalRep1x1, TARStage, MultiScaleTAR
 from changedetection.models.dcr_decoder import RepLocalBlock, DCRDecoder
 
@@ -54,6 +64,120 @@ def test_affine_interp_commutation():
     err = (lhs - rhs).abs().max().item()
     ok = err < 1e-12
     print(f"[{'OK' if ok else 'FAIL'}] affine-interp commutation (FP64): max_abs_error={err:.3e}")
+    return ok
+
+
+def test_phase_basis_algebra():
+    """T0: phi constants, PixelShuffle one-hot channel ordering, phase expansion."""
+    torch.manual_seed(0)
+    r = 4
+    r2 = r * r
+    basis = build_phase_basis(r)
+    i = torch.arange(r).view(r, 1).expand(r, r).reshape(-1).float()
+    j = torch.arange(r).view(1, r).expand(r, r).reshape(-1).float()
+    u = (2.0 * j + 1.0 - r) / r
+    v = (2.0 * i + 1.0 - r) / r
+    assert basis.shape == (4, r2)
+    assert torch.equal(basis[0], torch.ones(r2)), "phi0 must be all ones"
+    assert torch.equal(basis[1], u), "phi1 must be u_j=(2j+1-r)/r"
+    assert torch.equal(basis[2], v), "phi2 must be v_i=(2i+1-r)/r"
+    assert torch.equal(basis[3], u * v), "phi3 must be u_j*v_i"
+    print("[OK] PBRU phase basis phi = {1, u_j, v_i, u_j*v_i} (exact, fixed constants)")
+
+    # PyTorch PixelShuffle ordering: channel n=c*r2+p (p=i*r+j) -> pixel (i,j) of class c
+    for c in (0, 1):
+        for p in range(r2):
+            z = torch.zeros(1, 2 * r2, 2, 3)  # input channels = C*r^2
+            z[0, c * r2 + p, 1, 2] = 1.0
+            out = F.pixel_shuffle(z, r)  # (1,2,8,12)
+            ti, tj = 1 * r + p // r, 2 * r + p % r
+            assert out[0, c, ti, tj].item() == 1.0 and out.abs().sum().item() == 1.0, \
+                f"one-hot channel {p} must land at output pixel ({ti},{tj})"
+    print("[OK] PixelShuffle one-hot ordering: n=c*r^2+p -> (c, i=p//r, j=p%r) (exact)")
+
+    # phase expansion reshape convention (c-major, matches PBRUHead.forward and the fold)
+    x = torch.randn(2, 2, 5, 5)
+    for k in range(4):
+        expanded = (x.unsqueeze(2) * basis[k].view(1, 1, r2, 1, 1)).reshape(2, 2 * r2, 5, 5)
+        manual = torch.zeros_like(expanded)
+        for c in range(2):
+            for p in range(r2):
+                manual[:, c * r2 + p] = basis[k][p] * x[:, c]
+        assert torch.equal(expanded, manual), f"phase expansion k={k} must match c-major manual build"
+    print("[OK] phase expansion = E_phi_k(q) with n=c*r^2+p (exact vs manual)")
+    return True
+
+
+def perturb_pbru_head(h):
+    """Randomize a PBRUHead at TRAINED-HEAD magnitudes (not std=1: a std-1 head
+    would amplify the legitimate ~5e-5 TAR/DCR fold noise by ~100x through the
+    160-channel 1x1 and make the whole-model test meaningless)."""
+    with torch.no_grad():
+        for n, p in h.named_parameters():
+            if n.endswith(".weight") and ("branch" in n or "main_proj" in n):
+                p.normal_(0.0, 0.05)   # Kaiming-scale 1x1 weights (D=64-160)
+            elif n.endswith(".bias") and "main_proj" in n:
+                p.normal_(0.0, 0.05)
+            else:                       # BN gamma / beta
+                p.normal_(0.0, 0.5)
+        if h.use_phase_rep:
+            for bn in (h.bn_coarse, h.bn_px, h.bn_py, h.bn_pxy):
+                bn.running_mean.normal_()
+                bn.running_var.uniform_(0.5, 2.0)
+    return h
+
+
+def pbru_head_tests(device):
+    """T1: PBRUHead fold (FP32 tol=2e-5, non-trivial weights) + FP64 algebra."""
+    torch.manual_seed(2333)
+    x = torch.randn(2, 64, 32, 32, device=device)
+    C, r, r2 = 2, 4, 16
+
+    ok = True
+    h = PBRUHead(64, C, r, use_phase_rep=True).to(device)
+    perturb_pbru_head(h)
+    h.eval()
+    with torch.no_grad():
+        y0 = h(x)
+    h2 = copy.deepcopy(h)
+    h2.switch_to_deploy()
+    h2.eval()
+    with torch.no_grad():
+        y1 = h2(x)
+    err = (y0 - y1).abs().max().item()
+    ok &= err < 2e-5
+    print(f"[{'OK' if err < 2e-5 else 'FAIL'}] PBRUHead(phase) fold: max_abs_error={err:.3e}")
+    assert not any(("branch_" in k or "bn_" in k or "main_proj" in k)
+                   for k in h2.state_dict().keys()), "deploy PBRUHead must be branch-free"
+
+    hp = PBRUHead(64, C, r, use_phase_rep=False).to(device)
+    with torch.no_grad():
+        for p in hp.parameters():
+            p.normal_()
+    ok &= check_fold(hp, (x,), tol=2e-5, name="PBRUHead(plain PixelShuffle)")
+
+    # FP64 algebraic check of get_equivalent_kernel_bias vs a manual expansion
+    W, b = h.get_equivalent_kernel_bias()
+    assert W.dtype == torch.float64 and b.dtype == torch.float64
+    xd = x.double()
+    with torch.no_grad():
+        z = F.conv2d(xd, W, b)
+        y_alg = F.pixel_shuffle(z, r)
+        z2 = F.conv2d(xd, h.main_proj.weight.double(), h.main_proj.bias.double())
+        phi = h.phi.double()
+        for branch, bn, k in ((h.branch_coarse, h.bn_coarse, 0),
+                              (h.branch_px, h.bn_px, 1),
+                              (h.branch_py, h.bn_py, 2),
+                              (h.branch_pxy, h.bn_pxy, 3)):
+            V, bv = fold_conv_bn(branch.weight, None, bn)
+            q = F.conv2d(xd, V, bv)
+            e = (q.unsqueeze(2) * phi[k].view(1, 1, r2, 1, 1)).reshape(xd.shape[0], C * r2,
+                                                                       xd.shape[2], xd.shape[3])
+            z2 = z2 + e
+        y2 = F.pixel_shuffle(z2, r)
+    err64 = (y_alg - y2).abs().max().item()
+    ok &= err64 < 1e-12
+    print(f"[{'OK' if err64 < 1e-12 else 'FAIL'}] PBRUHead fold algebra (FP64): max_abs_error={err64:.3e}")
     return ok
 
 
@@ -94,7 +218,8 @@ def block_tests(device):
 
 
 def whole_model_test(device, cfg, pretrained, rep_mode="full", use_botr=False,
-                     use_nscr=False, nscr_scope="high2"):
+                     use_nscr=False, nscr_scope="high2", head_mode="bilinear",
+                     use_pbru=False, pbru_upscale=4):
     from changedetection.configs.config import get_config
     from changedetection.models.STRRepNet import STRRepNet
 
@@ -108,7 +233,8 @@ def whole_model_test(device, cfg, pretrained, rep_mode="full", use_botr=False,
 
     model = STRRepNet(
         pretrained=pretrained, rep_mode=rep_mode, use_botr=use_botr,
-        use_nscr=use_nscr, nscr_scope=nscr_scope,
+        use_nscr=use_nscr, nscr_scope=nscr_scope, head_mode=head_mode,
+        use_pbru=use_pbru, pbru_upscale=pbru_upscale,
         patch_size=v.PATCH_SIZE, in_chans=v.IN_CHANS, num_classes=config.MODEL.NUM_CLASSES,
         depths=v.DEPTHS, dims=v.EMBED_DIM,
         ssm_d_state=v.SSM_D_STATE, ssm_ratio=v.SSM_RATIO, ssm_rank_ratio=v.SSM_RANK_RATIO,
@@ -128,6 +254,10 @@ def whole_model_test(device, cfg, pretrained, rep_mode="full", use_botr=False,
     assert model.encoder.training is False, "encoder should stay eval after model.train()"
     print(f"[OK] encoder frozen (trainable={enc_trainable}, training={model.encoder.training})")
 
+    # PBRU branches are zero-init by design; perturb the head so the fold is non-trivial.
+    if head_mode == "pixelshuffle":
+        perturb_pbru_head(model.head)
+
     model.eval()
     torch.manual_seed(2333)  # deterministic inputs for reproducible argmax check
     pre = torch.randn(2, 3, 256, 256, device=device)
@@ -145,7 +275,8 @@ def whole_model_test(device, cfg, pretrained, rep_mode="full", use_botr=False,
     disagree = (y0.argmax(1) != y1.argmax(1)).float().mean().item()
     ok = err < 2e-4
     print(f"[{'OK' if ok else 'FAIL'}] STRRepNet whole model ({rep_mode}, botr={use_botr}, "
-          f"nscr={use_nscr}/{nscr_scope}): max_abs_error={err:.3e}, argmax_disagree={disagree:.3e}")
+          f"nscr={use_nscr}/{nscr_scope}, head={head_mode}, pbru={use_pbru}): "
+          f"max_abs_error={err:.3e}, argmax_disagree={disagree:.3e}")
     return ok
 
 
@@ -167,17 +298,26 @@ def main():
     print("=== affine-interpolation commutation (FP64) ===")
     c_ok = test_affine_interp_commutation()
 
-    print("=== block-level fold tests (tol=1e-5; FP64-composed kernels) ===")
+    print("=== PBRU phase basis + PixelShuffle ordering (T0, exact) ===")
+    t0_ok = test_phase_basis_algebra()
+
+    print("=== block-level fold tests (tol=2e-5; FP64-composed kernels) ===")
     b_ok = block_tests(device)
+    p_ok = pbru_head_tests(device)
 
     print("=== whole-model fold tests (error recorded; FP32 graphs, tol=2e-4) ===")
     w_ok = whole_model_test(device, args.cfg, args.pretrained_weight_path, args.rep_mode)
     wb_ok = whole_model_test(device, args.cfg, args.pretrained_weight_path, args.rep_mode, use_botr=True)
     wn_ok = whole_model_test(device, args.cfg, args.pretrained_weight_path, args.rep_mode,
                              use_nscr=True, nscr_scope="high2")
+    wp_ok = whole_model_test(device, args.cfg, args.pretrained_weight_path, args.rep_mode,
+                             head_mode="pixelshuffle", use_pbru=False)
+    wq_ok = whole_model_test(device, args.cfg, args.pretrained_weight_path, args.rep_mode,
+                             head_mode="pixelshuffle", use_pbru=True)
 
-    print(f"\n{'ALL PASSED' if (c_ok and b_ok and w_ok and wb_ok and wn_ok) else 'SOME FAILED'}")
-    sys.exit(0 if (c_ok and b_ok and w_ok and wb_ok and wn_ok) else 1)
+    all_ok = (c_ok and t0_ok and b_ok and p_ok and w_ok and wb_ok and wn_ok and wp_ok and wq_ok)
+    print(f"\n{'ALL PASSED' if all_ok else 'SOME FAILED'}")
+    sys.exit(0 if all_ok else 1)
 
 
 if __name__ == "__main__":

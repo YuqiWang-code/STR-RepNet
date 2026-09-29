@@ -115,11 +115,15 @@ class Trainer(object):
         model = STRRepNet(
             pretrained=self.args.pretrained_weight_path,
             rep_mode=self.args.rep_mode,
+            dim=self.args.decoder_dim,
             use_residual=self.args.use_residual,
             encoder_train=self.args.encoder_train,
             use_botr=bool(self.args.use_botr),
             use_nscr=bool(self.args.use_nscr),
             nscr_scope=self.args.nscr_scope,
+            head_mode=self.args.head_mode,
+            use_pbru=bool(self.args.use_pbru),
+            pbru_upscale=self.args.pbru_upscale,
             patch_size=v.PATCH_SIZE,
             in_chans=v.IN_CHANS,
             num_classes=config.MODEL.NUM_CLASSES,
@@ -284,6 +288,12 @@ class Trainer(object):
                     self.log(f"[NSCR-GAMMA-NORM] {name}/l={st['nscr_l_gamma']:.4e}")
                 if "nscr_h_gamma" in st:
                     self.log(f"[NSCR-GAMMA-NORM] {name}/h={st['nscr_h_gamma']:.4e}")
+        # PBRU phase-basis diagnostics (before folding; not used for checkpoint selection)
+        if self.args.use_pbru:
+            st = getattr(self.model.head, "branch_stats", lambda: None)() or {}
+            if "pbru_coarse_gamma" in st:
+                self.log(f"[PBRU-GAMMA-NORM] coarse={st['pbru_coarse_gamma']:.4e} "
+                         f"px={st['pbru_px_gamma']:.4e} py={st['pbru_py_gamma']:.4e} pxy={st['pbru_pxy_gamma']:.4e}")
 
         ref_pre = torch.randn(1, 3, self.args.crop_size, self.args.crop_size).cuda()
         ref_post = torch.randn(1, 3, self.args.crop_size, self.args.crop_size).cuda()
@@ -314,7 +324,10 @@ class Trainer(object):
         self.log(f"[REP-MODE] {self.args.rep_mode}")
         self.log(f"[BOTR] {int(self.args.use_botr)}")
         self.log(f"[NSCR] {int(self.args.use_nscr)}")
-        self.log(f"[NSCR-SCOPE] {self.args.nscr_scope}")
+        self.log("[NSCR-SCOPE] " + str(self.args.nscr_scope))
+        self.log(f"[HEAD-MODE] {self.args.head_mode}")
+        self.log(f"[PBRU] {int(self.args.use_pbru)}")
+        self.log(f"[DECODER-DIM] {self.args.decoder_dim}")
         self.log(f"[ENCODER-TRAIN] {self.args.encoder_train}")
         self.log(f"[TEMPORAL-SWAP-PROB] {self.args.temporal_swap_prob}")
         self.log(f"[TOTAL-TRAIN-GRAPH-PARAMS] {fmt_params(train_total)} M")
@@ -368,11 +381,23 @@ def main():
     parser.add_argument('--encoder_train', type=str, default='frozen', choices=['frozen', 'last2', 'full'])
     parser.add_argument('--encoder_lr_ratio', type=float, default=0.1)
     parser.add_argument('--temporal_swap_prob', type=float, default=0.0)
+    parser.add_argument('--decoder_dim', type=int, default=160)
+    parser.add_argument('--head_mode', type=str, default='bilinear', choices=['bilinear', 'pixelshuffle'])
+    parser.add_argument('--use_pbru', type=int, default=0)
+    parser.add_argument('--pbru_upscale', type=int, default=4)
     parser.add_argument('--num_workers', type=int, default=8)
     parser.add_argument('--seed', type=int, default=2333)
     parser.add_argument('--resume', type=str, default=None)
     parser.add_argument('--gpu', type=int, default=0)
     args = parser.parse_args()
+
+    # Run7 config guards: PBRU only on the PixelShuffle head, orthogonal to BOTR/NSCR.
+    if args.use_pbru and args.head_mode != "pixelshuffle":
+        parser.error("--use_pbru requires --head_mode pixelshuffle")
+    if args.use_pbru and (args.use_nscr or args.use_botr):
+        parser.error("--use_pbru cannot combine with --use_nscr/--use_botr (Run7 attribution)")
+    if args.head_mode == "pixelshuffle" and args.pbru_upscale != 4:
+        parser.error("--pbru_upscale must be 4 (decoder 64x64 -> 256x256)")
 
     if args.gpu >= 0:
         torch.cuda.set_device(args.gpu)

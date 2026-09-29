@@ -385,3 +385,122 @@ class NSCRPairFuse1x1(nn.Module):
             if hasattr(self, name):
                 delattr(self, name)
         return self
+
+
+def build_phase_basis(upscale=4):
+    """Fixed low-order 4x4 phase basis (Run7 PBRU): shape (4, r^2), float32.
+
+    Row k is phi_k[p] for p = i*r + j (PyTorch PixelShuffle channel order,
+    i = output row phase, j = output col phase):
+      phi00[p] = 1
+      phi10[p] = u_j = (2j+1-r)/r     (horizontal phase)
+      phi01[p] = v_i = (2i+1-r)/r     (vertical phase)
+      phi11[p] = u_j * v_i
+    Fixed constants: no trainable params, no deploy cost.
+    """
+    r = int(upscale)
+    i = torch.arange(r).view(r, 1).expand(r, r).reshape(-1).float()
+    j = torch.arange(r).view(1, r).expand(r, r).reshape(-1).float()
+    u = (2.0 * j + 1.0 - r) / r
+    v = (2.0 * i + 1.0 - r) / r
+    basis = torch.stack([torch.ones_like(u), u, v, u * v], dim=0)  # (4, r^2)
+    return basis
+
+
+class PBRUHead(nn.Module):
+    """Run7 PBRU: Phase-Basis Reparameterized Upsampling head.
+
+    Deploy graph:
+        X (B,D,H,W) -> single 1x1 (D -> C*r^2) -> PixelShuffle(r) -> (B,C,rH,rW)
+
+    Training graph adds four zero-init (BN gamma=beta=0) phase-basis branches:
+        y = main_proj(X) + sum_k E_phi_k( BN_k( branch_k(X) ) )
+    where E_phi_k expands the 2-channel branch output to the C*r^2 phase channels
+    by the fixed basis phi_k. At deploy the branches are analytically absorbed
+    into the single 1x1 (FP64 composition, one FP32 cast); epoch-0 aux output is
+    exactly 0, so M1_PBRU starts from the plain PixelShuffle prediction.
+    """
+
+    def __init__(self, in_channels, num_classes=2, upscale=4, use_phase_rep=True, deploy=False):
+        super().__init__()
+        self.in_channels = in_channels
+        self.num_classes = num_classes
+        self.upscale = int(upscale)
+        self.use_phase_rep = use_phase_rep
+        self.deploy = deploy
+        self.out_channels = num_classes * self.upscale * self.upscale
+        if deploy:
+            self.proj = nn.Conv2d(in_channels, self.out_channels, 1, bias=True)
+        else:
+            self.main_proj = nn.Conv2d(in_channels, self.out_channels, 1, bias=True)
+            if self.use_phase_rep:
+                self.branch_coarse = nn.Conv2d(in_channels, num_classes, 1, bias=False)
+                self.bn_coarse = nn.BatchNorm2d(num_classes)
+                self.branch_px = nn.Conv2d(in_channels, num_classes, 1, bias=False)
+                self.bn_px = nn.BatchNorm2d(num_classes)
+                self.branch_py = nn.Conv2d(in_channels, num_classes, 1, bias=False)
+                self.bn_py = nn.BatchNorm2d(num_classes)
+                self.branch_pxy = nn.Conv2d(in_channels, num_classes, 1, bias=False)
+                self.bn_pxy = nn.BatchNorm2d(num_classes)
+                for bn in (self.bn_coarse, self.bn_px, self.bn_py, self.bn_pxy):
+                    nn.init.zeros_(bn.weight)
+                    nn.init.zeros_(bn.bias)
+            self.register_buffer("phi", build_phase_basis(self.upscale), persistent=False)
+
+    def forward(self, x):
+        if self.deploy:
+            return F.pixel_shuffle(self.proj(x), self.upscale)
+        z = self.main_proj(x)
+        if self.use_phase_rep:
+            r2 = self.upscale * self.upscale
+            for branch, bn, k in ((self.branch_coarse, self.bn_coarse, 0),
+                                  (self.branch_px, self.bn_px, 1),
+                                  (self.branch_py, self.bn_py, 2),
+                                  (self.branch_pxy, self.bn_pxy, 3)):
+                q = bn(branch(x))                                   # (B,C,H,W)
+                q = q.unsqueeze(2) * self.phi[k].view(1, 1, r2, 1, 1)  # (B,C,r2,H,W)
+                q = q.reshape(q.shape[0], self.out_channels, q.shape[3], q.shape[4])
+                z = z + q
+        return F.pixel_shuffle(z, self.upscale)
+
+    def get_equivalent_kernel_bias(self):
+        """FP64 fold of main + phase-basis branches into (W, b) of shape (C*r^2, D, 1, 1)."""
+        C = self.num_classes
+        r2 = self.upscale * self.upscale
+        W = self.main_proj.weight.detach().double()                 # (C*r2, D, 1, 1)
+        b = self.main_proj.bias.detach().double()                   # (C*r2,)
+        if self.use_phase_rep:
+            phi = self.phi.double()                                 # (4, r2)
+            for branch, bn, k in ((self.branch_coarse, self.bn_coarse, 0),
+                                  (self.branch_px, self.bn_px, 1),
+                                  (self.branch_py, self.bn_py, 2),
+                                  (self.branch_pxy, self.bn_pxy, 3)):
+                V, bv = fold_conv_bn(branch.weight, None, bn)       # V:(C,D,1,1) bv:(C,)
+                # channel n = c*r2 + p (c-major, matches forward reshape):
+                Vt = (phi[k].view(1, r2, 1, 1, 1) * V.view(C, 1, V.shape[1], V.shape[2], V.shape[3]))
+                W = W + Vt.reshape(C * r2, V.shape[1], V.shape[2], V.shape[3])
+                b = b + (phi[k].view(1, r2) * bv.view(C, 1)).reshape(-1)
+        return W, b
+
+    def branch_stats(self):
+        s = {}
+        if self.use_phase_rep:
+            s["pbru_coarse_gamma"] = self.bn_coarse.weight.norm().item()
+            s["pbru_px_gamma"] = self.bn_px.weight.norm().item()
+            s["pbru_py_gamma"] = self.bn_py.weight.norm().item()
+            s["pbru_pxy_gamma"] = self.bn_pxy.weight.norm().item()
+        return s
+
+    def switch_to_deploy(self):
+        if self.deploy:
+            return self
+        kernel, bias = self.get_equivalent_kernel_bias()
+        self.proj = nn.Conv2d(self.in_channels, self.out_channels, 1, bias=True)
+        self.proj.weight.data = kernel.float()
+        self.proj.bias.data = bias.float()
+        self.deploy = True
+        for name in ("main_proj", "branch_coarse", "bn_coarse", "branch_px", "bn_px",
+                     "branch_py", "bn_py", "branch_pxy", "bn_pxy"):
+            if hasattr(self, name):
+                delattr(self, name)
+        return self

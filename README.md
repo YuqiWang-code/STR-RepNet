@@ -37,7 +37,8 @@ Lightweight Spatial-Temporal Structural Re-parameterization Network for Remote S
 - **DCR**（Decoder-wide Compositional Re-parameterization）：RepDW3 / RepPW1x1 / RepPairFuse1x1，整个 decoder 的可折叠算子图
 - **Edge-Basis**（Run3 迭代，已验证未达判据、未纳入主方法）：在 `DCRDecoder.refine.dw` 增加可折叠的 Sobel-X/Y 结构边缘基分支，部署仍折叠为单个 DW3×3（`--use_edge`）
 - **IBAS**（Run4 迭代，辅助训练机制）：最终 decoder feature 上挂 161 参数零初始化训练期边界头，GT 内侧边界（`B⁺=Y−Erode3×3(Y)`）在线生成，`BCE+Dice` 加权 0.1，`switch_to_deploy` 整支删除（`--use_boundary_aux`，部署 +0 参数/FLOPs）
-- **NSCR-Fuse**（Run6 迭代，主线候选）：`DCRDecoder` 的 fuse1+fuse2 加零初始化原生尺度 BN 分支（`BN_L(L)` + `U(BN_H(H))`），利用逐通道仿射与 bilinear 插值可交换性，部署时吸收回原 cross-scale 1×1（`--use_nscr`，部署 +0 参数/FLOPs）
+- **NSCR-Fuse**（Run6 迭代，已按判据停止）：`DCRDecoder` 的 fuse1+fuse2 加零初始化原生尺度 BN 分支（`BN_L(L)` + `U(BN_H(H))`），利用逐通道仿射与 bilinear 插值可交换性，部署时吸收回原 cross-scale 1×1（`--use_nscr`，部署 +0 参数/FLOPs）
+- **PBRU**（Run7 迭代，主线候选）：Phase-Basis Reparameterized Upsampling 输出头——部署为单个 `Conv2d(D→C·r²,1)` + `PixelShuffle(r)`（全分辨率、无插值）；训练期叠加 4 个零初始化相位基分支 `{1,u,v,u·v}`（BN γ=β=0），FP64 解析折叠吸收（`--head_mode pixelshuffle --use_pbru 1`，部署 +0 参数/FLOPs vs 纯 PixelShuffle，经 D\*=158 预算搜索与 Run2 部署预算持平）
 
 - 模型入口：`models/changedetection/models/STRRepNet.py`（`STRRepNet`）
 - 核心文件：`reparam.py`（代数折叠原语）、`tar.py`（二时相 bridge）、`dcr_decoder.py`（多尺度解码器）
@@ -169,6 +170,17 @@ Run2 在 Run1 基础上做了两处改造（部署图/参数/FLOPs 完全不变�
 - 诊断结论（`analyse/levir_error_profile.py`）：small（≤502px）pixel recall 仅 80.8%、**24% 小目标完全漏检**（medium/large 92%/91%）；D0 full-encoder 无法修复（81.5%、漏检率 23.7%）→ 瓶颈在 decoder 侧；测试尺度 320 仅抬 Precision（Recall 反降）→ 非输入分辨率问题。按失败预案（情况 A：decoder 小目标保真瓶颈）下一轮转 **PBRU（Phase-Basis Reparameterized Upsampling + 精确预算回收）**。
 - 设计文档：[`docs/temporary/STR-RepNet_Run6_下一步改进方向与实验设计_NSCR-Fuse.md`](docs/temporary/STR-RepNet_Run6_下一步改进方向与实验设计_NSCR-Fuse.md)。
 
+## 实验结果（Run7：PBRU，进行中）
+
+- **主方案 PBRU**（Phase-Basis Reparameterized Upsampling）：输出头改为单个 `Conv2d(D→C·r²,1)` + `PixelShuffle(4)`（全分辨率、无插值）；训练期叠加 4 个零初始化（BN γ=β=0）相位基分支 `{1, u, v, u·v}`（粗/水平/垂直/对角），FP64 解析折叠吸收回单投影 → 部署与纯 PixelShuffle 完全一致、与 Run2 部署预算持平（D\*=158）。
+- Phase 0（已完成）：
+  - **机器预算搜索**（`analyse/search_pbru_budget.py`）：锚点 = Run2 部署图 = 28.828706 M / 12.6062 G；逐 D 下降搜索得 **D\*=158**（PBRU 部署 28.818618 M / 12.6055 G）。
+  - **阶段判别力预检**（`analyse/levir_stage_discriminability.py`，Run2 LEVIR 锚点，200 对 test 前 100 拟合/后 100 held-out）：训练头 AUROC@64=0.9881 > d1 全协方差 LDA 上界 0.9766（headroom −0.0115）→ 冻结 Run2 解码器下 d1 无静态粗尺度线性空间；PBRU 假设是**训练期端到端学习的亚单元相位自由度**，由 C0/C1/M1 对照裁决。
+  - 等价性验证全通过：冒烟（epoch-0 输出与 use_pbru=0 逐位一致、γ 梯度非零、部署 +0、fold 9.9e-05、argmax=0）；重参数化等价性 T0（相位基/PixelShuffle 通道序/相位展开，精确）+ T1（PBRUHead 折叠 1.4e-06、FP64 代数 2.2e-15）+ T2（全模型五图均 <2e-4、argmax 全 0）。
+- Phase 1（进行中，GPU0）：**C0_Bilinear_D158**（宽度控制）+ **M1_PBRU_D158** 同时训练 LEVIR（300 epoch）；C1_PixelShuffle_D158 在 M1 PASS/WEAK 后启动做 rep 归因。
+- 判据（LEVIR 锚点 F1=0.9144）：M1 PASS = F1≥0.9175 且 IoU≥0.8475 且 Precision≥0.9230 且预算/argmax 合格；FAIL = F1<0.9159 或 Precision<0.9220 → 停止 PBRU 不救机制。四数据集扩展需 M1 系统 PASS 且 M1−C1 有可辨识 rep 增益。
+- 设计文档：[`docs/temporary/STR-RepNet_Run7_PBRU_修改方案与实验设计.md`](docs/temporary/STR-RepNet_Run7_PBRU_修改方案与实验设计.md)；`train_scripts/TAR-DCR/Run7/README.md`。
+
 ## 参考文献
 
 调研文献按 [`docs/temporary/过去的想法/STR-RepNet_结构重参数化_2024-2026文献调研与创新空白.md`](docs/temporary/过去的想法/STR-RepNet_结构重参数化_2024-2026文献调研与创新空白.md)
@@ -185,10 +197,10 @@ models/                        # 全部代码
     datasets/                  # DataLoader（A/B/label + list 格式）
     models/                    # 6 个文件：
       Mamba_backbone.py        #   Frozen VMamba-Tiny 编码器
-      reparam.py               #   代数折叠原语（RepDW3/RepPW1x1/RepPairFuse1x1）
+      reparam.py               #   代数折叠原语（RepDW3/RepPW1x1/RepPairFuse1x1/NSCR/PBRUHead）
       tar.py                   #   TAR 二时相 bridge
       dcr_decoder.py           #   DCR 多尺度解码器
-      STRRepNet.py             #   顶层网络（switch_to_deploy）
+      STRRepNet.py             #   顶层网络（switch_to_deploy，head_mode/use_pbru）
       __init__.py
     script/
       train.py                 # 训练入口（rep_mode + 冻结 encoder + 部署测试）
@@ -200,9 +212,12 @@ models/                        # 全部代码
 train_scripts/
   baseline/Run1/               # HAM-CD baseline 启动脚本（历史，已归档）
   TAR-DCR/Run1/                # TAR-DCR 启动脚本（A0_Plain / A1_TAR / A2_Full）
+  TAR-DCR/Run7/                # PBRU 启动脚本（C0/C1/M1 × 4 数据集，D*=158）
 analyse/                       # 分析工具
   extract_metrics_to_excel.py  #   outputs → docs/experiment_metrics.xlsx
   models_to_txt.py             #   models 代码快照 + 指标 → docs/temporary/*.txt
+  search_pbru_budget.py        #   Run7 机器预算搜索（D*）
+  levir_stage_discriminability.py  # Run7 阶段判别力预检（LDA AUROC）
 outputs/                       # 训练日志（训练结束后下载到这里）
 docs/                          # 项目文档（temporary / 参考文献）
 ```

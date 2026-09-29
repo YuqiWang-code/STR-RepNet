@@ -2,6 +2,9 @@
 
 Run6 additions: --use_nscr checks (zero-init residual, gamma gradient, deploy
 branch deletion, deploy params/FLOPs identical to use_nscr=0, argmax=0).
+Run7 additions: --head_mode/--use_pbru checks (zero-init phase basis = exactly
+the plain PixelShuffle prediction at init, gamma gradient, deploy fold clean,
+deploy params/FLOPs identical to use_pbru=0).
 """
 import copy
 import os
@@ -24,9 +27,11 @@ def build_model(args, config):
     v = config.MODEL.VSSM
     return STRRepNet(
         pretrained=args.pretrained_weight_path, rep_mode=args.rep_mode,
-        use_residual=bool(args.use_residual), encoder_train=args.encoder_train,
+        dim=args.decoder_dim, use_residual=bool(args.use_residual),
+        encoder_train=args.encoder_train,
         use_botr=bool(args.use_botr), use_nscr=bool(args.use_nscr),
-        nscr_scope=args.nscr_scope,
+        nscr_scope=args.nscr_scope, head_mode=args.head_mode,
+        use_pbru=bool(args.use_pbru), pbru_upscale=args.pbru_upscale,
         patch_size=v.PATCH_SIZE, in_chans=v.IN_CHANS, num_classes=config.MODEL.NUM_CLASSES,
         depths=v.DEPTHS, dims=v.EMBED_DIM,
         ssm_d_state=v.SSM_D_STATE, ssm_ratio=v.SSM_RATIO, ssm_rank_ratio=v.SSM_RANK_RATIO,
@@ -53,6 +58,10 @@ def main():
     ap.add_argument('--use_botr', type=int, default=0)
     ap.add_argument('--use_nscr', type=int, default=0)
     ap.add_argument('--nscr_scope', type=str, default='high2', choices=['high2', 'lonly', 'honly'])
+    ap.add_argument('--decoder_dim', type=int, default=160)
+    ap.add_argument('--head_mode', type=str, default='bilinear', choices=['bilinear', 'pixelshuffle'])
+    ap.add_argument('--use_pbru', type=int, default=0)
+    ap.add_argument('--pbru_upscale', type=int, default=4)
     ap.add_argument('--gpu', type=int, default=0)
     args = ap.parse_args()
 
@@ -77,6 +86,13 @@ def main():
                     b = getattr(m, bn)
                     assert b.weight.abs().sum().item() == 0.0 and b.bias.abs().sum().item() == 0.0
         print("  NSCR zero-init OK (bn_l/bn_h weight=bias=0; residual output is exactly 0 at init)")
+
+    if args.use_pbru:
+        assert model.head.__class__.__name__ == "PBRUHead", "head should be PBRUHead"
+        for name in ("bn_coarse", "bn_px", "bn_py", "bn_pxy"):
+            b = getattr(model.head, name)
+            assert b.weight.abs().sum().item() == 0.0 and b.bias.abs().sum().item() == 0.0
+        print("  PBRU zero-init OK (4 branch BN weight=bias=0)")
 
     # encoder train mode per encoder_train
     enc_trainable = sum(p.numel() for p in model.encoder.parameters() if p.requires_grad)
@@ -114,6 +130,33 @@ def main():
                     assert g is not None and g.abs().sum().item() > 0, f"{name}.{bn} grad must be non-zero"
         print("  NSCR gamma grads non-zero OK")
 
+    if args.use_pbru:
+        print("[2c/6] PBRU epoch-0 identity vs use_pbru=0 ...")
+        torch.manual_seed(2333)
+        m_a = build_model(args, config).cuda()
+        torch.manual_seed(2333)
+        args_p0 = argparse.Namespace(**{**vars(args), "use_pbru": 0})
+        m_b = build_model(args_p0, config).cuda()
+        m_a.eval()
+        m_b.eval()
+        with torch.no_grad():
+            oa = m_a(pre, post)
+            ob = m_b(pre, post)
+        d = (oa - ob).abs().max().item()
+        assert d == 0.0, f"PBRU init must equal plain PixelShuffle exactly, got {d}"
+        print(f"  PBRU epoch-0 output == plain PixelShuffle output exactly (max_diff={d})")
+
+        print("[2d/6] PBRU gamma gradient flow ...")
+        m_grad = copy.deepcopy(model)
+        m_grad.train()
+        out_g = m_grad(pre, post)
+        loss = torch.nn.functional.cross_entropy(out_g, torch.randint(0, 2, (2, 256, 256)).cuda())
+        loss.backward()
+        for name in ("bn_coarse", "bn_px", "bn_py", "bn_pxy"):
+            g = getattr(m_grad.head, name).weight.grad
+            assert g is not None and g.abs().sum().item() > 0, f"head.{name} grad must be non-zero"
+        print("  PBRU gamma grads non-zero OK")
+
     print("[3/6] deploy fold ...")
     deploy = copy.deepcopy(model)
     deploy.switch_to_deploy()
@@ -121,6 +164,9 @@ def main():
     sd_keys = set(deploy.state_dict().keys())
     has_nscr = any(("bn_l" in k or "bn_h" in k or ".core." in k) for k in sd_keys)
     assert not has_nscr, "deploy graph must not contain bn_l/bn_h/core"
+    has_pbru = any(("branch_" in k or "bn_coarse" in k or "bn_px" in k or "bn_py" in k
+                    or "bn_pxy" in k or "main_proj" in k) for k in sd_keys)
+    assert not has_pbru, "deploy graph must not contain branch_/bn_/main_proj"
     with torch.no_grad():
         out_d = deploy(pre, post)
     err = (out - out_d).abs().max().item()
@@ -154,6 +200,29 @@ def main():
         print(f"  deploy FLOPs nscr={f_n:.4f} vs 0={f_0:.4f} (batch2)")
         assert abs(f_n - f_0) < 0.01, "deploy FLOPs differ"
         print(f"  deploy Params/FLOPs identical to use_nscr=0: OK ({deploy_params/1e6:.3f} M)")
+    elif args.use_pbru:
+        # deploy params / FLOPs must be IDENTICAL to the use_pbru=0 (plain PixelShuffle) model
+        args0 = argparse.Namespace(**{**vars(args), "use_pbru": 0})
+        model0 = build_model(args0, config).cuda()
+        deploy0 = copy.deepcopy(model0)
+        deploy0.switch_to_deploy()
+        deploy0.eval()
+        p0 = sum(p.numel() for p in deploy0.parameters())
+        assert p0 == deploy_params, f"deploy params differ: pbru={deploy_params} vs 0={p0}"
+        from fvcore.nn import flop_count
+        from classification.models.vmamba import selective_scan_flop_jit
+        supported = {
+            "prim::PythonOp.SelectiveScanMamba": selective_scan_flop_jit,
+            "prim::PythonOp.SelectiveScanOflex": selective_scan_flop_jit,
+            "prim::PythonOp.SelectiveScanCore": selective_scan_flop_jit,
+        }
+        with torch.no_grad():
+            c_n, _ = flop_count(deploy, (pre, post), supported_ops=supported)
+            c_0, _ = flop_count(deploy0, (pre, post), supported_ops=supported)
+        f_n, f_0 = sum(c_n.values()), sum(c_0.values())
+        print(f"  deploy FLOPs pbru={f_n:.4f} vs 0={f_0:.4f} (batch2)")
+        assert abs(f_n - f_0) < 0.01, "deploy FLOPs differ"
+        print(f"  deploy Params/FLOPs identical to use_pbru=0: OK ({deploy_params/1e6:.3f} M)")
     else:
         print(f"  deploy params = {deploy_params/1e6:.3f} M")
 
