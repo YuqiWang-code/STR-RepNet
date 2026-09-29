@@ -44,9 +44,9 @@ bilinear×4），而非输入分辨率 / encoder。Run7 用结构重参数化给
 | 组 | 配置（均 D=158, last2） | 状态 |
 |---|---|---|
 | A0 | Run2 full_last2 锚点（F1=0.9144 / IoU=0.8424 / Precision=0.9260，不重跑） | 复用 |
-| C0_Bilinear_D158 | bilinear 头 + D=158（宽度控制，PBRU=0） | **训练中** |
-| M1_PBRU_D158 | pixelshuffle 头 + 相位基分支（PBRU=1） | **训练中** |
-| C1_PixelShuffle_D158 | 纯 PixelShuffle 头（PBRU=0，phase-rep 归因） | M1 PASS/WEAK 后 |
+| C0_Bilinear_D158 | bilinear 头 + D=158（宽度控制，PBRU=0） | **完成**（LEVIR+WHU） |
+| M1_PBRU_D158 | pixelshuffle 头 + 相位基分支（PBRU=1） | **完成**（LEVIR+WHU） |
+| C1_PixelShuffle_D158 | 纯 PixelShuffle 头（PBRU=0，phase-rep 归因） | **训练中**（LEVIR+WHU） |
 
 - 公共：`rep_mode=full / use_residual=1 / use_botr=0 / use_nscr=0 / temporal_swap_prob=0.0 /
   seed=2333 / 300 epoch / batch 16 / lr 1e-4 / lovasz 2.0`。
@@ -68,6 +68,26 @@ bilinear×4），而非输入分辨率 / encoder。Run7 用结构重参数化给
   正向迹象）；< +0.05pp = rep-not-supported（收益主要来自 learned PixelShuffle 头）。
 - 四数据集扩展标准：Macro F1 ≥ 92.25%、LEVIR ≥ 91.75%、至少 3/4 数据集 ΔF1 ≥ 0、
   任一退化 ≤ 0.15pp；每数据集 deploy cap 合格 + argmax 分歧 = 0。
+
+## Phase 1 结果（C0 + M1 × LEVIR + WHU，已完成）
+
+| exp | 数据集 | F1 | Recall | Precision | IoU | ΔF1 vs A0 | M1−C0 |
+|---|---|---|---|---|---|---|---|
+| C0_Bilinear_D158 | LEVIR | 0.9140 | 0.9116 | 0.9164 | 0.8416 | −0.04pp | — |
+| M1_PBRU_D158 | LEVIR | **0.9161** | 0.9039 | 0.9287 | 0.8452 | **+0.17pp** | **+0.21pp** |
+| C0_Bilinear_D158 | WHU | 0.9522 | 0.9424 | 0.9621 | 0.9087 | +0.08pp | — |
+| M1_PBRU_D158 | WHU | 0.9506 | 0.9378 | 0.9638 | 0.9059 | −0.08pp | −0.16pp |
+
+- **M1/LEVIR 判据 = WEAK**（F1=0.9161 落在 0.9159~0.9175 带内，且 IoU 0.8452 < 0.8475）；
+  Precision 0.9287 > 0.9230 ✓；Deploy 28.819M / 12.6055G ≤ 预算 ✓；argmax 0 ✓；
+  fold 1.43e-05。
+- 关键动态（LEVIR）：C0 宽度控制表现为 Recall↑/Precision↓（0.9116/0.9164，F1 持平 A0）；
+  M1 的相位头把 Precision 拉回 0.9287（甚至高于 A0）且 Recall 保住 +0.07pp → 净 +0.21pp（vs C0）。
+  分支确实学到了非平凡结构（γ 范数 pxy=0.41 > px≈py≈0.23~0.25 > coarse≈0.05）。
+- WHU：C0 +0.08pp（宽度恢复无害），M1 −0.08pp（在 0.15pp 容忍内）；M1−C0 = −0.16pp。
+- 按预注册协议（WEAK → 最多补 C1 归因）已启动 **C1_PixelShuffle_D158 × LEVIR + WHU**
+  （GPU0），用于拆分 PixelShuffle 拓扑收益与 phase-basis rep 收益（doc §17/19-C/D）。
+- 完整汇总见 `outputs/TAR-DCR/Run7/_SUMMARY.md`。
 
 ## 等价性验证（Run7 全套，GPU0 已通过）
 
