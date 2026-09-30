@@ -184,8 +184,14 @@ Run2 在 Run1 基础上做了两处改造（部署图/参数/FLOPs 完全不变�
   | M1_PBRU_D158 | **0.9161** | 0.9506 | **+0.17 / −0.08pp** |
   - **M1/LEVIR = WEAK**（0.9161 ∈ [0.9159, 0.9175)，IoU 0.8452 差 0.23pp；Precision 0.9287 ✓，Deploy 28.819M/12.6055G ✓，argmax 0 ✓）。关键动态：C0 宽度控制 Recall↑/Precision↓（F1 持平），M1 相位头把 Precision 拉回 0.9287 并保住 Recall → **M1−C0 = +0.21pp**；PBRU 分支学到非平凡结构（γ 范数 pxy 0.41 > px/py 0.23~0.25 > coarse 0.05）。
   - WHU：M1 −0.08pp（0.15pp 容忍内）；M1−C0 = −0.16pp。
-- Phase 2（进行中，GPU0）：**C1_PixelShuffle_D158** × LEVIR + WHU，按预注册协议做 rep 归因
-  （M1−C1 ≥ +0.15pp = rep-supported；+0.05~0.15pp = rep-weak；< +0.05pp = rep-not-supported）。
+- Phase 2（已完成）：**C1_PixelShuffle_D158** × LEVIR + WHU 归因：
+  | 效应拆解 | LEVIR | WHU |
+  |---|---|---|
+  | 宽度（C0−A0） | −0.04pp | +0.08pp |
+  | PixelShuffle 拓扑（C1−C0） | +0.12pp | −0.35pp |
+  | phase-basis rep（M1−C1） | **+0.09pp（rep-weak）** | **+0.19pp（rep-supported）** |
+  - 一致性机制：rep 在两个数据集上都表现为**精度提升**（+0.63/+0.44pp，相位基分支≈输出置信度锐化）；拓扑 LEVIR 正、WHU 负。
+  - **Run7 结论**：M1/LEVIR WEAK（0.9161<0.9175）+ rep 效应不一致 → 按 doc §28 **不扩 SYSU/CDD**；PBRU 不能宣称稳定普适的 rep 增益，只能作为「输出头相位置信度提升 + 可折叠相位基」的单 seed 观察记录（LEVIR +0.17pp ≈ 拓扑 +0.12pp + rep +0.09pp）。硬条件全程合格（预算内、argmax=0、fold ~1.4e-5）。
 - 判据（LEVIR 锚点 F1=0.9144）：M1 PASS = F1≥0.9175 且 IoU≥0.8475 且 Precision≥0.9230 且预算/argmax 合格；FAIL = F1<0.9159 或 Precision<0.9220 → 停止 PBRU 不救机制。四数据集扩展需 M1 系统 PASS 且 M1−C1 有可辨识 rep 增益。
 - 设计文档：[`docs/temporary/STR-RepNet_Run7_PBRU_修改方案与实验设计.md`](docs/temporary/STR-RepNet_Run7_PBRU_修改方案与实验设计.md)；`train_scripts/TAR-DCR/Run7/README.md`。
 

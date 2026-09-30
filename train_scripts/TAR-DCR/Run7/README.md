@@ -89,6 +89,23 @@ bilinear×4），而非输入分辨率 / encoder。Run7 用结构重参数化给
   （GPU0），用于拆分 PixelShuffle 拓扑收益与 phase-basis rep 收益（doc §17/19-C/D）。
 - 完整汇总见 `outputs/TAR-DCR/Run7/_SUMMARY.md`。
 
+## Phase 2 结果（C1 归因，已完成）与最终归因
+
+| 数据集 | A0 | C0 | C1 | M1 | 宽度效应 (C0−A0) | 拓扑效应 (C1−C0) | rep 效应 (M1−C1) |
+|---|---|---|---|---|---|---|---|
+| LEVIR | 0.9144 | 0.9140 | 0.9152 | 0.9161 | −0.04pp | +0.12pp | **+0.09pp（rep-weak）** |
+| WHU | 0.9514 | 0.9522 | 0.9487 | 0.9506 | +0.08pp | −0.35pp | **+0.19pp（rep-supported）** |
+
+- C1 硬条件：deploy 28.819M / 12.6055G ≤ 预算 ✓、argmax=0 ✓（两数据集）。
+- 一致性机制：phase-basis rep 在两个数据集上都表现为**精度提升**（LEVIR Prec 0.9224→0.9287
+  +0.63pp；WHU 0.9594→0.9638 +0.44pp），即相位基分支的作用更像"输出置信度锐化"；
+  PixelShuffle 拓扑则 LEVIR 正（+0.12pp，小目标）、WHU 负（−0.35pp）。
+- **最终判定**（doc §28「只有 structural-rep effect 成立才扩 WHU→SYSU→CDD」）：
+  rep 效应方向一致为正但幅度不一致（LEVIR rep-weak 单 seed 迹象 / WHU rep-supported 却未挽回
+  M1<C0、且 M1/LEVIR 系统判定 WEAK）→ **不扩 SYSU/CDD**，PBRU 不能宣称稳定普适的结构重参数化
+  增益。可写入论文的诚实表述：输出头相位置信度提升 + 可折叠相位基（LEVIR 与 Run6 诊断一致的小
+  目标输出头瓶颈方向）的单 seed 观察，其中 LEVIR +0.17pp（vs A0）≈ 拓扑 +0.12pp + rep +0.09pp。
+
 ## 等价性验证（Run7 全套，GPU0 已通过）
 
 - 冒烟：PBRU 零初始化（4 分支 γ=β=0）、epoch-0 输出与 use_pbru=0 **逐位一致**、γ 梯度非零、
