@@ -75,6 +75,11 @@ def parse_block(block):
     d["PBRU"] = int(pb.group(1)) if pb else None
     dd = re.search(r"\[DECODER-DIM\]\s+(\d+)", block)
     d["DecoderDim"] = int(dd.group(1)) if dd else None
+    # Run8 tags
+    mp = re.search(r"\[MPCR\]\s+(\d+)", block)
+    d["MPCR"] = int(mp.group(1)) if mp else None
+    mm = re.search(r"\[MPCR-MODE\]\s+(\w+)", block)
+    d["MPCRMode"] = mm.group(1) if mm else None
     return d
 
 
@@ -130,7 +135,7 @@ def main():
     headers = ["Tag", "Run", "Experiment", "Dataset"] + METRIC_KEYS + [
         "TrainGraphParams(M)", "TrainableParams(M)", "DeployParams(M)", "DeployFLOPs(G)",
         "ReparamErr", "RepMode", "Botr", "NSCR", "NSCRScope", "EncoderTrain",
-        "HeadMode", "PBRU", "DecoderDim"
+        "HeadMode", "PBRU", "DecoderDim", "MPCR", "MPCRMode"
     ]
     ws.append(headers)
     for c in ws[1]:
@@ -148,6 +153,7 @@ def main():
             info.get("ReparamErr"), info.get("RepMode"),
             info.get("Botr"), info.get("NSCR"), info.get("NSCRScope"), info.get("EncoderTrain"),
             info.get("HeadMode"), info.get("PBRU"), info.get("DecoderDim"),
+            info.get("MPCR"), info.get("MPCRMode"),
         ]
         ws.append(row)
 
@@ -172,7 +178,7 @@ def main():
         "A": 10, "B": 8, "C": 14, "D": 16,
         "E": 10, "F": 10, "G": 8, "H": 8, "I": 8, "J": 8,
         "K": 16, "L": 14, "M": 14, "N": 12, "O": 12, "P": 10,
-        "Q": 6, "R": 6, "S": 10, "T": 12, "U": 10, "V": 6, "W": 10,
+        "Q": 6, "R": 6, "S": 10, "T": 12, "U": 10, "V": 6, "W": 10, "X": 6, "Y": 10,
     }
     for col, w in widths.items():
         ws.column_dimensions[col].width = w
