@@ -70,3 +70,24 @@ Run7 归因结论：PixelShuffle 拓扑数据集敏感（LEVIR +0.12pp / WHU −
 `analyse/levir_fine_stage_profile.py`：hook block1 / refine.dw(±SiLU) / refine.pw / refine
 最终输出五级特征，统计 centroid 距离、Fisher、对角 LDA AUROC、协方差有效秩（熵）、
 平均通道间相关，验证 MPCR 是否真正改变最终通道表征（仅机制解释，不挑 checkpoint，不设新判据）。
+
+## 实验结果（LEVIR + WHU，已完成）—— M1 FAIL
+
+| exp | 数据集 | F1 | Recall | Precision | IoU | ΔF1 vs A0 | M1−C0 |
+|---|---|---|---|---|---|---|---|
+| C0_MPCR_Same2 | LEVIR | 0.9135 | 0.9067 | 0.9204 | 0.8408 | −0.09pp | — |
+| M1_MPCR_Multi2 | LEVIR | **0.9129** | 0.8972 | 0.9291 | 0.8397 | **−0.15pp** | **−0.06pp** |
+| C0_MPCR_Same2 | WHU | 0.9520 | 0.9370 | 0.9675 | 0.9084 | +0.06pp | — |
+| M1_MPCR_Multi2 | WHU | 0.9500 | 0.9390 | 0.9612 | 0.9047 | −0.14pp | −0.20pp |
+
+- **M1/LEVIR = FAIL**（F1 0.9129 < 失败线 0.9159，双触发：Precision 0.9291 虽达标但 F1 不过线）；
+  rep 归因 **rep-not-supported**（M1−C0 = −0.06pp）。硬条件全程合格（28.829M / 12.6062G、
+  argmax=0、fold 1.1~1.4e-05）。
+- 机制记录：分支确实学到结构（γ 范数 p0≈0.93 / p1≈0.88，权重范数 ~9.4），但折叠回的
+  dense W 未改善最终表征——fine-stage 画像（`diagnostics/Run8_MPCR/`）显示 M1 的 d1 对角
+  LDA AUROC@64 0.9372 < A0 0.9397、fisher_mean 0.273 < 0.284（有效秩 31.9 vs 30.7 略升）。
+- 动力学签名与 Run7 相同：M1 相对 C0 表现为 Recall↓/Precision↑（LEVIR −0.95/+0.87pp，
+  WHU 0.9612 vs 0.9675），即训练期 channel-basis 分支倾向"置信度锐化"而非找回漏检。
+- **§18-E 裁决：停止 MPCR，不救机制**（禁 groups/permutation sweep、禁加第三分区、禁
+  loss/threshold/PixelShuffle/full-encoder 叠加）；SYSU/CDD 不启动。
+- 完整汇总见 `outputs/TAR-DCR/Run8/_SUMMARY.md`。

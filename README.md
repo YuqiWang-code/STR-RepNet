@@ -39,7 +39,7 @@ Lightweight Spatial-Temporal Structural Re-parameterization Network for Remote S
 - **IBAS**（Run4 迭代，辅助训练机制）：最终 decoder feature 上挂 161 参数零初始化训练期边界头，GT 内侧边界（`B⁺=Y−Erode3×3(Y)`）在线生成，`BCE+Dice` 加权 0.1，`switch_to_deploy` 整支删除（`--use_boundary_aux`，部署 +0 参数/FLOPs）
 - **NSCR-Fuse**（Run6 迭代，已按判据停止）：`DCRDecoder` 的 fuse1+fuse2 加零初始化原生尺度 BN 分支（`BN_L(L)` + `U(BN_H(H))`），利用逐通道仿射与 bilinear 插值可交换性，部署时吸收回原 cross-scale 1×1（`--use_nscr`，部署 +0 参数/FLOPs）
 - **PBRU**（Run7 迭代，已按判据 WEAK 归档）：Phase-Basis Reparameterized Upsampling 输出头——部署为单个 `Conv2d(D→C·r²,1)` + `PixelShuffle(r)`（全分辨率、无插值）；训练期叠加 4 个零初始化相位基分支 `{1,u,v,u·v}`（BN γ=β=0），FP64 解析折叠吸收（`--head_mode pixelshuffle --use_pbru 1`，部署 +0 参数/FLOPs vs 纯 PixelShuffle，经 D\*=158 预算搜索与 Run2 部署预算持平）
-- **MPCR-Fine**（Run8 迭代，主线候选）：Fine-stage Multi-Partition Channel Reparameterization——`refine.pw` 加两个同参数量零初始化 grouped 1×1 分支（groups=4，连续/交织互补分区），`W_eq = W_core + Σ P⁻¹W̃P` 解析折叠回原 dense PW（`--use_mpcr`，部署 +0 参数/FLOPs，预算机器验证 D\*=160、Δ=0）
+- **MPCR-Fine**（Run8 迭代，已按判据 FAIL 停止）：Fine-stage Multi-Partition Channel Reparameterization——`refine.pw` 加两个同参数量零初始化 grouped 1×1 分支（groups=4，连续/交织互补分区），`W_eq = W_core + Σ P⁻¹W̃P` 解析折叠回原 dense PW（`--use_mpcr`，部署 +0 参数/FLOPs，预算机器验证 D\*=160、Δ=0）
 
 - 模型入口：`models/changedetection/models/STRRepNet.py`（`STRRepNet`）
 - 核心文件：`reparam.py`（代数折叠原语）、`tar.py`（二时相 bridge）、`dcr_decoder.py`（多尺度解码器）
@@ -196,11 +196,21 @@ Run2 在 Run1 基础上做了两处改造（部署图/参数/FLOPs 完全不变�
 - 判据（LEVIR 锚点 F1=0.9144）：M1 PASS = F1≥0.9175 且 IoU≥0.8475 且 Precision≥0.9230 且预算/argmax 合格；FAIL = F1<0.9159 或 Precision<0.9220 → 停止 PBRU 不救机制。四数据集扩展需 M1 系统 PASS 且 M1−C1 有可辨识 rep 增益。
 - 设计文档：[`docs/temporary/STR-RepNet_Run7_PBRU_修改方案与实验设计.md`](docs/temporary/STR-RepNet_Run7_PBRU_修改方案与实验设计.md)；`train_scripts/TAR-DCR/Run7/README.md`。
 
-## 实验结果（Run8：MPCR-Fine，进行中）
+## 实验结果（Run8：MPCR-Fine，已完成 —— M1 FAIL）
 
 - **主方案 MPCR-Fine**（Fine-stage Multi-Partition Channel Reparameterization）：Run7 归因证明输出侧已榨干 → 转向 fine-stage 表征。只在 `refine.pw` 加两个同参数量 grouped 1×1 训练分支（groups=4），C0=两个连续分区（容量控制）、M1=连续+交织互补分区；BN γ=β=0 零初始化保证 epoch-0 输出与 Run2 逐位一致，部署经 `W_eq = W_core + P0⁻¹W̃0P0 + P1⁻¹W̃1P1` 解析折叠回原 dense PW（`--use_mpcr`，部署 +0 参数/FLOPs）。
-- 预训练门槛全部通过（GPU0）：T0 置换/嵌入精确（P⁻¹GP 2.1e-14）；T1 折叠 4.8~6.0e-06 + FP64 代数 ~7e-15；T2 全模型 5.9~8.8e-05、argmax 全 0；冒烟 epoch-0 与 Run2 **逐位一致**（max_diff=0.0）、部署 Params/FLOPs 与锚点精确相等；**预算机器验证 D\*=160、ΔParams=ΔFLOPs=0**（28.828706M / 12.6062G）；LEVIR 2-epoch dry run 双通过。
-- Phase 1（进行中，GPU0 并行 4 job）：**C0_MPCR_Same2 + M1_MPCR_Multi2** × **LEVIR + WHU**（300 epoch，last2，D=160，bilinear；WHU 为容量驱动启动、先于 §18 gate，结果仅在 LEVIR 过 gate 后参与扩展裁决）。判据沿用 PASS/WEAK/FAIL 体系；rep 归因 = M1−C0（≥+0.15pp 且精度不降超 0.15pp 才算 rep-supported）；§18 继续/停止逻辑（WEAK/FAIL 不扩、不 sweep、不救机制）。
+- 预训练门槛全部通过：T0 置换/嵌入精确（P⁻¹GP 2.1e-14）；T1 折叠 4.8~6.0e-06 + FP64 代数 ~7e-15；T2 全模型 5.9~8.8e-05、argmax 全 0；冒烟 epoch-0 与 Run2 **逐位一致**（max_diff=0.0）、部署 Params/FLOPs 与锚点精确相等；**预算机器验证 D\*=160、ΔParams=ΔFLOPs=0**。
+- 结果（LEVIR + WHU，GPU0 并行 4 job）：
+
+  | exp | LEVIR F1 | WHU F1 | ΔF1 vs A0 |
+  |---|---|---|---|
+  | C0_MPCR_Same2 | 0.9135 | 0.9520 | −0.09 / +0.06pp |
+  | M1_MPCR_Multi2 | **0.9129** | 0.9500 | **−0.15 / −0.14pp** |
+
+- **M1/LEVIR = FAIL**（0.9129 < 0.9159），rep 归因 **rep-not-supported**（M1−C0 = −0.06pp；
+  动力学仍为 Recall↓/Precision↑ 的"置信度锐化"签名）。机制画像：M1 的 d1 对角 LDA
+  AUROC@64 0.9372 < A0 0.9397 → MPCR 未改善最终表征（分支 γ~0.9 学到了结构但折叠后无净益）。
+  按 §18-E **停止 MPCR，不救机制**；SYSU/CDD 不启动；硬条件全程合格（预算内、argmax=0）。
 - 设计文档：[`docs/temporary/STR-RepNet_Run8_MPCR-Fine_设计与实验方案.md`](docs/temporary/STR-RepNet_Run8_MPCR-Fine_设计与实验方案.md)；`train_scripts/TAR-DCR/Run8/README.md`。
 
 ## 参考文献
