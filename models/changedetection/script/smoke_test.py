@@ -5,6 +5,9 @@ branch deletion, deploy params/FLOPs identical to use_nscr=0, argmax=0).
 Run7 additions: --head_mode/--use_pbru checks (zero-init phase basis = exactly
 the plain PixelShuffle prediction at init, gamma gradient, deploy fold clean,
 deploy params/FLOPs identical to use_pbru=0).
+Run8 additions: --use_mpcr checks (MPCR only on refine.pw, BN zero-init,
+epoch-0 output EXACTLY equal to use_mpcr=0, group-conv/gamma gradients non-zero,
+deploy branch deletion, deploy Params/FLOPs EXACTLY equal to the anchor).
 """
 import copy
 import os
@@ -32,6 +35,7 @@ def build_model(args, config):
         use_botr=bool(args.use_botr), use_nscr=bool(args.use_nscr),
         nscr_scope=args.nscr_scope, head_mode=args.head_mode,
         use_pbru=bool(args.use_pbru), pbru_upscale=args.pbru_upscale,
+        use_mpcr=bool(args.use_mpcr), mpcr_mode=args.mpcr_mode, mpcr_groups=args.mpcr_groups,
         patch_size=v.PATCH_SIZE, in_chans=v.IN_CHANS, num_classes=config.MODEL.NUM_CLASSES,
         depths=v.DEPTHS, dims=v.EMBED_DIM,
         ssm_d_state=v.SSM_D_STATE, ssm_ratio=v.SSM_RATIO, ssm_rank_ratio=v.SSM_RANK_RATIO,
@@ -62,6 +66,9 @@ def main():
     ap.add_argument('--head_mode', type=str, default='bilinear', choices=['bilinear', 'pixelshuffle'])
     ap.add_argument('--use_pbru', type=int, default=0)
     ap.add_argument('--pbru_upscale', type=int, default=4)
+    ap.add_argument('--use_mpcr', type=int, default=0)
+    ap.add_argument('--mpcr_mode', type=str, default='multi2', choices=['same2', 'multi2'])
+    ap.add_argument('--mpcr_groups', type=int, default=4)
     ap.add_argument('--gpu', type=int, default=0)
     args = ap.parse_args()
 
@@ -93,6 +100,20 @@ def main():
             b = getattr(model.head, name)
             assert b.weight.abs().sum().item() == 0.0 and b.bias.abs().sum().item() == 0.0
         print("  PBRU zero-init OK (4 branch BN weight=bias=0)")
+
+    if args.use_mpcr:
+        # MPCR must appear ONLY on refine.pw
+        assert model.decoder.refine.pw.__class__.__name__ == "MPCRPW1x1", \
+            "refine.pw should be MPCRPW1x1"
+        for name in ("block1", "block2", "block3"):
+            assert getattr(model.decoder, name).pw.__class__.__name__ == "RepPW1x1", \
+                f"{name}.pw must stay RepPW1x1"
+        assert model.decoder.refine.dw.__class__.__name__ == "RepDW3", "refine.dw untouched"
+        pw = model.decoder.refine.pw
+        for bn in ("bn0", "bn1"):
+            b = getattr(pw, bn)
+            assert b.weight.abs().sum().item() == 0.0 and b.bias.abs().sum().item() == 0.0
+        print("  MPCR zero-init OK (bn0/bn1 weight=bias=0; MPCR only on refine.pw)")
 
     # encoder train mode per encoder_train
     enc_trainable = sum(p.numel() for p in model.encoder.parameters() if p.requires_grad)
@@ -157,6 +178,51 @@ def main():
             assert g is not None and g.abs().sum().item() > 0, f"head.{name} grad must be non-zero"
         print("  PBRU gamma grads non-zero OK")
 
+    if args.use_mpcr:
+        print("[2e/6] MPCR epoch-0 identity vs use_mpcr=0 ...")
+        torch.manual_seed(2333)
+        m_a = build_model(args, config).cuda()
+        torch.manual_seed(2333)
+        args_m0 = argparse.Namespace(**{**vars(args), "use_mpcr": 0})
+        m_b = build_model(args_m0, config).cuda()
+        # The g0/g1 Kaiming init inside MPCRPW1x1 consumes RNG BEFORE the head is
+        # built, so the two models' HEAD inits differ. The head is not part of the
+        # MPCR change: sync it so the epoch-0 check isolates the branches only.
+        m_b.head.load_state_dict(m_a.head.state_dict())
+        m_a.eval()
+        m_b.eval()
+        with torch.no_grad():
+            oa = m_a(pre, post)
+            ob = m_b(pre, post)
+        d = (oa - ob).abs().max().item()
+        assert d == 0.0, f"MPCR epoch-0 output must equal the Run2 core EXACTLY, got {d}"
+        print(f"  MPCR epoch-0 output == Run2 core output exactly (max_diff={d})")
+
+        print("[2f/6] MPCR gradient flow ...")
+        m_grad = copy.deepcopy(model)
+        m_grad.train()
+        out_g = m_grad(pre, post)
+        loss = torch.nn.functional.cross_entropy(out_g, torch.randint(0, 2, (2, 256, 256)).cuda())
+        loss.backward()
+        pw = m_grad.decoder.refine.pw
+        for name in ("bn0", "bn1"):
+            g = getattr(pw, name).weight.grad
+            assert g is not None and g.abs().sum().item() > 0, f"{name} gamma grad must be non-zero"
+        # Zero-init branch dynamics: with gamma=0 the grouped conv weights get NO
+        # gradient at step 0 (dL/dw = dL/dy * gamma/sigma * x = 0). They start
+        # receiving gradients once gamma departs from zero -> verify with a nudge.
+        with torch.no_grad():
+            pw.bn0.weight.add_(0.01)
+            pw.bn1.weight.add_(0.01)
+        m_grad.zero_grad()
+        out_g2 = m_grad(pre, post)
+        loss2 = torch.nn.functional.cross_entropy(out_g2, torch.randint(0, 2, (2, 256, 256)).cuda())
+        loss2.backward()
+        for name in ("g0", "g1"):
+            g = getattr(pw, name).weight.grad
+            assert g is not None and g.abs().sum().item() > 0, f"{name} weight grad must be non-zero after gamma nudge"
+        print("  MPCR gamma grads non-zero @init + group-conv grads non-zero after gamma nudge: OK")
+
     print("[3/6] deploy fold ...")
     deploy = copy.deepcopy(model)
     deploy.switch_to_deploy()
@@ -167,6 +233,9 @@ def main():
     has_pbru = any(("branch_" in k or "bn_coarse" in k or "bn_px" in k or "bn_py" in k
                     or "bn_pxy" in k or "main_proj" in k) for k in sd_keys)
     assert not has_pbru, "deploy graph must not contain branch_/bn_/main_proj"
+    has_mpcr = any(("g0" in k or "g1" in k or "bn0" in k or "bn1" in k
+                    or ".core." in k) for k in sd_keys)
+    assert not has_mpcr, "deploy graph must not contain g0/g1/bn0/bn1/core"
     with torch.no_grad():
         out_d = deploy(pre, post)
     err = (out - out_d).abs().max().item()
@@ -223,6 +292,29 @@ def main():
         print(f"  deploy FLOPs pbru={f_n:.4f} vs 0={f_0:.4f} (batch2)")
         assert abs(f_n - f_0) < 0.01, "deploy FLOPs differ"
         print(f"  deploy Params/FLOPs identical to use_pbru=0: OK ({deploy_params/1e6:.3f} M)")
+    elif args.use_mpcr:
+        # deploy params / FLOPs must be EXACTLY the Run2 anchor (use_mpcr=0, D=160)
+        args0 = argparse.Namespace(**{**vars(args), "use_mpcr": 0})
+        model0 = build_model(args0, config).cuda()
+        deploy0 = copy.deepcopy(model0)
+        deploy0.switch_to_deploy()
+        deploy0.eval()
+        p0 = sum(p.numel() for p in deploy0.parameters())
+        assert p0 == deploy_params, f"deploy params differ: mpcr={deploy_params} vs anchor={p0}"
+        from fvcore.nn import flop_count
+        from classification.models.vmamba import selective_scan_flop_jit
+        supported = {
+            "prim::PythonOp.SelectiveScanMamba": selective_scan_flop_jit,
+            "prim::PythonOp.SelectiveScanOflex": selective_scan_flop_jit,
+            "prim::PythonOp.SelectiveScanCore": selective_scan_flop_jit,
+        }
+        with torch.no_grad():
+            c_n, _ = flop_count(deploy, (pre, post), supported_ops=supported)
+            c_0, _ = flop_count(deploy0, (pre, post), supported_ops=supported)
+        f_n, f_0 = sum(c_n.values()), sum(c_0.values())
+        print(f"  deploy FLOPs mpcr={f_n:.4f} vs anchor={f_0:.4f} (batch2)")
+        assert f_n == f_0, "deploy FLOPs must be EXACTLY the Run2 anchor"
+        print(f"  deploy Params/FLOPs EXACTLY equal to the Run2 anchor: OK ({deploy_params/1e6:.3f} M)")
     else:
         print(f"  deploy params = {deploy_params/1e6:.3f} M")
 

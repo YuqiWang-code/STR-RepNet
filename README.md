@@ -38,7 +38,8 @@ Lightweight Spatial-Temporal Structural Re-parameterization Network for Remote S
 - **Edge-Basis**（Run3 迭代，已验证未达判据、未纳入主方法）：在 `DCRDecoder.refine.dw` 增加可折叠的 Sobel-X/Y 结构边缘基分支，部署仍折叠为单个 DW3×3（`--use_edge`）
 - **IBAS**（Run4 迭代，辅助训练机制）：最终 decoder feature 上挂 161 参数零初始化训练期边界头，GT 内侧边界（`B⁺=Y−Erode3×3(Y)`）在线生成，`BCE+Dice` 加权 0.1，`switch_to_deploy` 整支删除（`--use_boundary_aux`，部署 +0 参数/FLOPs）
 - **NSCR-Fuse**（Run6 迭代，已按判据停止）：`DCRDecoder` 的 fuse1+fuse2 加零初始化原生尺度 BN 分支（`BN_L(L)` + `U(BN_H(H))`），利用逐通道仿射与 bilinear 插值可交换性，部署时吸收回原 cross-scale 1×1（`--use_nscr`，部署 +0 参数/FLOPs）
-- **PBRU**（Run7 迭代，主线候选）：Phase-Basis Reparameterized Upsampling 输出头——部署为单个 `Conv2d(D→C·r²,1)` + `PixelShuffle(r)`（全分辨率、无插值）；训练期叠加 4 个零初始化相位基分支 `{1,u,v,u·v}`（BN γ=β=0），FP64 解析折叠吸收（`--head_mode pixelshuffle --use_pbru 1`，部署 +0 参数/FLOPs vs 纯 PixelShuffle，经 D\*=158 预算搜索与 Run2 部署预算持平）
+- **PBRU**（Run7 迭代，已按判据 WEAK 归档）：Phase-Basis Reparameterized Upsampling 输出头——部署为单个 `Conv2d(D→C·r²,1)` + `PixelShuffle(r)`（全分辨率、无插值）；训练期叠加 4 个零初始化相位基分支 `{1,u,v,u·v}`（BN γ=β=0），FP64 解析折叠吸收（`--head_mode pixelshuffle --use_pbru 1`，部署 +0 参数/FLOPs vs 纯 PixelShuffle，经 D\*=158 预算搜索与 Run2 部署预算持平）
+- **MPCR-Fine**（Run8 迭代，主线候选）：Fine-stage Multi-Partition Channel Reparameterization——`refine.pw` 加两个同参数量零初始化 grouped 1×1 分支（groups=4，连续/交织互补分区），`W_eq = W_core + Σ P⁻¹W̃P` 解析折叠回原 dense PW（`--use_mpcr`，部署 +0 参数/FLOPs，预算机器验证 D\*=160、Δ=0）
 
 - 模型入口：`models/changedetection/models/STRRepNet.py`（`STRRepNet`）
 - 核心文件：`reparam.py`（代数折叠原语）、`tar.py`（二时相 bridge）、`dcr_decoder.py`（多尺度解码器）
@@ -195,6 +196,13 @@ Run2 在 Run1 基础上做了两处改造（部署图/参数/FLOPs 完全不变�
 - 判据（LEVIR 锚点 F1=0.9144）：M1 PASS = F1≥0.9175 且 IoU≥0.8475 且 Precision≥0.9230 且预算/argmax 合格；FAIL = F1<0.9159 或 Precision<0.9220 → 停止 PBRU 不救机制。四数据集扩展需 M1 系统 PASS 且 M1−C1 有可辨识 rep 增益。
 - 设计文档：[`docs/temporary/STR-RepNet_Run7_PBRU_修改方案与实验设计.md`](docs/temporary/STR-RepNet_Run7_PBRU_修改方案与实验设计.md)；`train_scripts/TAR-DCR/Run7/README.md`。
 
+## 实验结果（Run8：MPCR-Fine，进行中）
+
+- **主方案 MPCR-Fine**（Fine-stage Multi-Partition Channel Reparameterization）：Run7 归因证明输出侧已榨干 → 转向 fine-stage 表征。只在 `refine.pw` 加两个同参数量 grouped 1×1 训练分支（groups=4），C0=两个连续分区（容量控制）、M1=连续+交织互补分区；BN γ=β=0 零初始化保证 epoch-0 输出与 Run2 逐位一致，部署经 `W_eq = W_core + P0⁻¹W̃0P0 + P1⁻¹W̃1P1` 解析折叠回原 dense PW（`--use_mpcr`，部署 +0 参数/FLOPs）。
+- 预训练门槛全部通过（GPU0）：T0 置换/嵌入精确（P⁻¹GP 2.1e-14）；T1 折叠 4.8~6.0e-06 + FP64 代数 ~7e-15；T2 全模型 5.9~8.8e-05、argmax 全 0；冒烟 epoch-0 与 Run2 **逐位一致**（max_diff=0.0）、部署 Params/FLOPs 与锚点精确相等；**预算机器验证 D\*=160、ΔParams=ΔFLOPs=0**（28.828706M / 12.6062G）；LEVIR 2-epoch dry run 双通过。
+- Phase 1（进行中，GPU0 并行）：**C0_MPCR_Same2 + M1_MPCR_Multi2** × LEVIR（300 epoch，last2，D=160，bilinear）。判据沿用 PASS/WEAK/FAIL 体系；rep 归因 = M1−C0（≥+0.15pp 且精度不降超 0.15pp 才算 rep-supported）；§18 继续/停止逻辑（WEAK/FAIL 不扩、不 sweep、不救机制）。
+- 设计文档：[`docs/temporary/STR-RepNet_Run8_MPCR-Fine_设计与实验方案.md`](docs/temporary/STR-RepNet_Run8_MPCR-Fine_设计与实验方案.md)；`train_scripts/TAR-DCR/Run8/README.md`。
+
 ## 参考文献
 
 调研文献按 [`docs/temporary/过去的想法/STR-RepNet_结构重参数化_2024-2026文献调研与创新空白.md`](docs/temporary/过去的想法/STR-RepNet_结构重参数化_2024-2026文献调研与创新空白.md)
@@ -227,11 +235,14 @@ train_scripts/
   baseline/Run1/               # HAM-CD baseline 启动脚本（历史，已归档）
   TAR-DCR/Run1/                # TAR-DCR 启动脚本（A0_Plain / A1_TAR / A2_Full）
   TAR-DCR/Run7/                # PBRU 启动脚本（C0/C1/M1 × 4 数据集，D*=158）
+  TAR-DCR/Run8/                # MPCR-Fine 启动脚本（C0_MPCR_Same2 / M1_MPCR_Multi2）
 analyse/                       # 分析工具
   extract_metrics_to_excel.py  #   outputs → docs/experiment_metrics.xlsx
   models_to_txt.py             #   models 代码快照 + 指标 → docs/temporary/*.txt
   search_pbru_budget.py        #   Run7 机器预算搜索（D*）
   levir_stage_discriminability.py  # Run7 阶段判别力预检（LDA AUROC）
+  search_run8_budget.py        #   Run8 预算机器验证（必须 D*=160）
+  levir_fine_stage_profile.py  #   Run8 精细阶段表征画像（机制解释）
 outputs/                       # 训练日志（训练结束后下载到这里）
 docs/                          # 项目文档（temporary / 参考文献）
 ```

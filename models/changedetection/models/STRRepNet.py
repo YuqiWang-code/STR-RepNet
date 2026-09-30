@@ -29,6 +29,11 @@ use_pbru : add the four zero-init phase-basis BN branches (coarse/u/v/uv) inside
     PBRUHead at train time; folded analytically into the single 1x1 projection at
     deploy (+0 deploy Params/FLOPs vs plain PixelShuffle, +0 vs Run2 after D* search).
 pbru_upscale : r of PixelShuffle (fixed 4; 64x64 -> 256x256).
+
+use_mpcr (Run8): refine.pw becomes MPCRPW1x1 — two zero-init grouped-1x1 BN
+    branches (identity + identity|interleaved partition) absorbed into the original
+    dense PW at deploy via P^-1 G P (+0 deploy Params/FLOPs). mpcr_mode in
+    {"same2", "multi2"}, mpcr_groups fixed 4.
 """
 import torch
 import torch.nn as nn
@@ -44,7 +49,8 @@ class STRRepNet(nn.Module):
     def __init__(self, pretrained=None, rep_mode="full", dim=160, use_residual=True,
                  encoder_train="frozen", use_botr=False, use_nscr=False,
                  nscr_scope="high2", head_mode="bilinear", use_pbru=False,
-                 pbru_upscale=4, **encoder_kwargs):
+                 pbru_upscale=4, use_mpcr=False, mpcr_mode="multi2", mpcr_groups=4,
+                 **encoder_kwargs):
         super().__init__()
         self.rep_mode = rep_mode
         self.dim = dim
@@ -56,6 +62,9 @@ class STRRepNet(nn.Module):
         self.head_mode = head_mode
         self.use_pbru = use_pbru
         self.pbru_upscale = int(pbru_upscale)
+        self.use_mpcr = use_mpcr
+        self.mpcr_mode = mpcr_mode
+        self.mpcr_groups = int(mpcr_groups)
 
         self.encoder = Backbone_VSSM(out_indices=(0, 1, 2, 3), pretrained=pretrained, **encoder_kwargs)
         self._setup_encoder_train()
@@ -69,7 +78,8 @@ class STRRepNet(nn.Module):
             use_residual=use_residual, use_reverse_aux=use_botr,
         )
         self.decoder = DCRDecoder(dim=dim, use_aux=use_dcr_aux, use_residual=use_residual,
-                                  nscr_scope=self.nscr_scope)
+                                  nscr_scope=self.nscr_scope, use_mpcr=use_mpcr,
+                                  mpcr_mode=mpcr_mode, mpcr_groups=mpcr_groups)
         if head_mode == "pixelshuffle":
             self.head = PBRUHead(dim, num_classes=2, upscale=self.pbru_upscale,
                                  use_phase_rep=use_pbru)

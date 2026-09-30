@@ -17,6 +17,14 @@ Run7 additions (PBRU):
     perturb_pbru_head: conv std 0.05, BN gamma std 0.5), plus an FP64
     algebraic check of get_equivalent_kernel_bias against a manual expansion;
   - T2: whole-model fold with head_mode="pixelshuffle" (use_pbru 0/1).
+
+Run8 additions (MPCR-Fine):
+  - T0: permutation roundtrip P^-1(Px)==x exact, interleaved pattern exact,
+    grouped-kernel dense embedding == grouped conv (FP64 <1e-12),
+    P^-1 G(Px) == (P^-1 G P)x incl. bias (FP64 <1e-12);
+  - T1: MPCRPW1x1 (same2 + multi2) fold, FP32 tol=2e-5, non-trivial branches
+    (conv std 0.05, BN gamma std 0.5) + FP64 algebra vs manual composition;
+  - T2: whole-model fold with use_mpcr (same2/multi2), tol=2e-4, argmax=0.
 """
 import argparse
 import copy
@@ -31,7 +39,9 @@ if _MODELS_ROOT not in sys.path:
     sys.path.insert(0, _MODELS_ROOT)
 
 from changedetection.models.reparam import (RepDW3, RepPW1x1, RepPairFuse1x1, NSCRPairFuse1x1,
-                                            PBRUHead, build_phase_basis, fold_conv_bn)
+                                            PBRUHead, build_phase_basis, fold_conv_bn,
+                                            MPCRPW1x1, make_interleaved_permutation,
+                                            invert_permutation, group1x1_to_dense_fp64)
 from changedetection.models.tar import TemporalRep1x1, TARStage, MultiScaleTAR
 from changedetection.models.dcr_decoder import RepLocalBlock, DCRDecoder
 
@@ -181,6 +191,86 @@ def pbru_head_tests(device):
     return ok
 
 
+def test_mpcr_permutation_algebra():
+    """T0 (Run8): permutation exactness + grouped->dense embedding + P^-1 G P fold."""
+    torch.manual_seed(0)
+    D, g, q = 160, 4, 40
+    p = make_interleaved_permutation(D, g)
+    inv = invert_permutation(p)
+    x = torch.randn(2, D, 8, 8)
+    assert torch.equal(x[:, p][:, inv], x), "P^-1(Px) must be exact"
+    expect = torch.tensor([k * q + j for j in range(q) for k in range(g)])
+    assert torch.equal(p, expect), "interleaved permutation pattern mismatch"
+    print("[OK] PBRU->MPCR: permutation roundtrip exact + interleaved pattern [0,40,80,120,...] exact")
+
+    # grouped conv direct vs dense embedding (FP64)
+    Wg = torch.randn(D, q, 1, 1, dtype=torch.float64)
+    Wd = group1x1_to_dense_fp64(Wg, g)
+    xd = x.double()
+    y_grouped = F.conv2d(xd, Wg, None, groups=g)
+    y_dense = F.conv2d(xd, Wd, None)
+    err1 = (y_grouped - y_dense).abs().max().item()
+    assert err1 < 1e-12, f"grouped->dense embedding error {err1}"
+    print(f"[{'OK' if err1 < 1e-12 else 'FAIL'}] grouped 1x1 -> dense embedding (FP64): {err1:.3e}")
+
+    # P^-1 G(Px) vs (P^-1 G P)x, with bias
+    z = xd[:, p]
+    bg = torch.randn(D, dtype=torch.float64)
+    y_pg = F.conv2d(z, Wg, bg, groups=g)[:, inv]
+    Wf = Wd[inv][:, inv]
+    bf = bg[inv]
+    y_fold = F.conv2d(xd, Wf, bf)
+    err2 = (y_pg - y_fold).abs().max().item()
+    assert err2 < 1e-12, f"permuted-group fold error {err2}"
+    print(f"[{'OK' if err2 < 1e-12 else 'FAIL'}] P^-1 G(Px) == (P^-1 G P)x + P^-1 b (FP64): {err2:.3e}")
+    return True
+
+
+def mpcr_block_tests(device):
+    """T1 (Run8): MPCRPW1x1 train->deploy fold (FP32 tol=2e-5) + FP64 algebra."""
+    torch.manual_seed(2333)
+    x = torch.randn(2, 160, 16, 16, device=device)
+    ok = True
+    for mode in ("same2", "multi2"):
+        h = MPCRPW1x1(160, groups=4, mode=mode).to(device)
+        with torch.no_grad():
+            for m in (h.g0, h.g1):
+                m.weight.normal_(0.0, 0.05)
+            for bn in (h.bn0, h.bn1):
+                bn.weight.normal_(0.0, 0.5)
+                bn.bias.normal_(0.0, 0.5)
+                bn.running_mean.normal_()
+                bn.running_var.uniform_(0.5, 2.0)
+        h.eval()
+        with torch.no_grad():
+            y0 = h(x)
+        h2 = copy.deepcopy(h)
+        h2.switch_to_deploy()
+        h2.eval()
+        with torch.no_grad():
+            y1 = h2(x)
+        err = (y0 - y1).abs().max().item()
+        ok &= err < 2e-5
+        assert not any(("g0" in k or "g1" in k or "bn0" in k or "bn1" in k or ".core." in k)
+                       for k in h2.state_dict().keys()), "deploy MPCRPW1x1 must be branch-free"
+        print(f"[{'OK' if err < 2e-5 else 'FAIL'}] MPCRPW1x1({mode}) fold: max_abs_error={err:.3e}")
+
+        W, b = h.get_equivalent_kernel_bias()
+        assert W.dtype == torch.float64 and b.dtype == torch.float64
+        with torch.no_grad():
+            z = F.conv2d(x.double(), W, b)
+            Wc, bc = h.core.get_equivalent_kernel_bias()
+            z2 = F.conv2d(x.double(), Wc, bc)
+            for g_, bn_, inv_ in ((h.g0, h.bn0, h.inv0), (h.g1, h.bn1, h.inv1)):
+                Wg, bg = fold_conv_bn(g_.weight, None, bn_)
+                Wd = group1x1_to_dense_fp64(Wg, h.groups)
+                z2 = z2 + F.conv2d(x.double(), Wd[inv_][:, inv_], bg[inv_])
+        err64 = (z - z2).abs().max().item()
+        ok &= err64 < 1e-12
+        print(f"[{'OK' if err64 < 1e-12 else 'FAIL'}] MPCRPW1x1({mode}) fold algebra (FP64): {err64:.3e}")
+    return ok
+
+
 def block_tests(device):
     torch.manual_seed(2333)
     C = 160
@@ -219,7 +309,7 @@ def block_tests(device):
 
 def whole_model_test(device, cfg, pretrained, rep_mode="full", use_botr=False,
                      use_nscr=False, nscr_scope="high2", head_mode="bilinear",
-                     use_pbru=False, pbru_upscale=4):
+                     use_pbru=False, pbru_upscale=4, use_mpcr=False, mpcr_mode="multi2"):
     from changedetection.configs.config import get_config
     from changedetection.models.STRRepNet import STRRepNet
 
@@ -235,6 +325,7 @@ def whole_model_test(device, cfg, pretrained, rep_mode="full", use_botr=False,
         pretrained=pretrained, rep_mode=rep_mode, use_botr=use_botr,
         use_nscr=use_nscr, nscr_scope=nscr_scope, head_mode=head_mode,
         use_pbru=use_pbru, pbru_upscale=pbru_upscale,
+        use_mpcr=use_mpcr, mpcr_mode=mpcr_mode, mpcr_groups=4,
         patch_size=v.PATCH_SIZE, in_chans=v.IN_CHANS, num_classes=config.MODEL.NUM_CLASSES,
         depths=v.DEPTHS, dims=v.EMBED_DIM,
         ssm_d_state=v.SSM_D_STATE, ssm_ratio=v.SSM_RATIO, ssm_rank_ratio=v.SSM_RANK_RATIO,
@@ -257,6 +348,17 @@ def whole_model_test(device, cfg, pretrained, rep_mode="full", use_botr=False,
     # PBRU branches are zero-init by design; perturb the head so the fold is non-trivial.
     if head_mode == "pixelshuffle":
         perturb_pbru_head(model.head)
+    # MPCR branches are zero-init by design; perturb refine.pw so the fold is non-trivial.
+    if use_mpcr:
+        with torch.no_grad():
+            pw = model.decoder.refine.pw
+            for m in (pw.g0, pw.g1):
+                m.weight.normal_(0.0, 0.05)
+            for bn in (pw.bn0, pw.bn1):
+                bn.weight.normal_(0.0, 0.5)
+                bn.bias.normal_(0.0, 0.5)
+                bn.running_mean.normal_()
+                bn.running_var.uniform_(0.5, 2.0)
 
     model.eval()
     torch.manual_seed(2333)  # deterministic inputs for reproducible argmax check
@@ -275,7 +377,8 @@ def whole_model_test(device, cfg, pretrained, rep_mode="full", use_botr=False,
     disagree = (y0.argmax(1) != y1.argmax(1)).float().mean().item()
     ok = err < 2e-4
     print(f"[{'OK' if ok else 'FAIL'}] STRRepNet whole model ({rep_mode}, botr={use_botr}, "
-          f"nscr={use_nscr}/{nscr_scope}, head={head_mode}, pbru={use_pbru}): "
+          f"nscr={use_nscr}/{nscr_scope}, head={head_mode}, pbru={use_pbru}, "
+          f"mpcr={use_mpcr}/{mpcr_mode}): "
           f"max_abs_error={err:.3e}, argmax_disagree={disagree:.3e}")
     return ok
 
@@ -301,9 +404,13 @@ def main():
     print("=== PBRU phase basis + PixelShuffle ordering (T0, exact) ===")
     t0_ok = test_phase_basis_algebra()
 
+    print("=== MPCR permutation + dense embedding (T0, exact) ===")
+    t0m_ok = test_mpcr_permutation_algebra()
+
     print("=== block-level fold tests (tol=2e-5; FP64-composed kernels) ===")
     b_ok = block_tests(device)
     p_ok = pbru_head_tests(device)
+    pm_ok = mpcr_block_tests(device)
 
     print("=== whole-model fold tests (error recorded; FP32 graphs, tol=2e-4) ===")
     w_ok = whole_model_test(device, args.cfg, args.pretrained_weight_path, args.rep_mode)
@@ -314,8 +421,13 @@ def main():
                              head_mode="pixelshuffle", use_pbru=False)
     wq_ok = whole_model_test(device, args.cfg, args.pretrained_weight_path, args.rep_mode,
                              head_mode="pixelshuffle", use_pbru=True)
+    wms_ok = whole_model_test(device, args.cfg, args.pretrained_weight_path, args.rep_mode,
+                              use_mpcr=True, mpcr_mode="same2")
+    wmm_ok = whole_model_test(device, args.cfg, args.pretrained_weight_path, args.rep_mode,
+                              use_mpcr=True, mpcr_mode="multi2")
 
-    all_ok = (c_ok and t0_ok and b_ok and p_ok and w_ok and wb_ok and wn_ok and wp_ok and wq_ok)
+    all_ok = (c_ok and t0_ok and t0m_ok and b_ok and p_ok and pm_ok
+              and w_ok and wb_ok and wn_ok and wp_ok and wq_ok and wms_ok and wmm_ok)
     print(f"\n{'ALL PASSED' if all_ok else 'SOME FAILED'}")
     sys.exit(0 if all_ok else 1)
 

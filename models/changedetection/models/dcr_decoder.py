@@ -3,6 +3,10 @@
 Run6 NSCR-Fuse: fuse1/fuse2 become NSCRPairFuse1x1 (native-scale zero-init BN
 branches, deploy-absorbed); the upsample of the semantic input moves inside the
 fuse wrapper so bn_h sees the NATIVE low resolution. fuse3 unchanged.
+
+Run8 MPCR-Fine: refine.pw can become MPCRPW1x1 (two zero-init grouped-1x1
+training branches with complementary channel partitions, absorbed into the
+original dense PW at deploy). block1/2/3, refine.dw, fuses stay unchanged.
 """
 import torch.nn as nn
 import torch.nn.functional as F
@@ -12,6 +16,7 @@ from changedetection.models.reparam import (
     RepPW1x1,
     RepPairFuse1x1,
     NSCRPairFuse1x1,
+    MPCRPW1x1,
     switch_module_to_deploy,
 )
 
@@ -24,13 +29,21 @@ NSCR_MODES = {
 
 
 class RepLocalBlock(nn.Module):
-    """Local refinement block: DW3 (residual) -> SiLU -> PW1 (residual) -> SiLU."""
+    """Local refinement block: DW3 (residual) -> SiLU -> PW1 (residual) -> SiLU.
 
-    def __init__(self, dim, use_aux=True, use_residual=True, deploy=False):
+    use_mpcr: PW becomes MPCRPW1x1 (Run8; refine.pw only) instead of RepPW1x1.
+    """
+
+    def __init__(self, dim, use_aux=True, use_residual=True, deploy=False,
+                 use_mpcr=False, mpcr_mode="multi2", mpcr_groups=4):
         super().__init__()
         self.dim = dim
         self.dw = RepDW3(dim, use_aux=use_aux, use_residual=use_residual, deploy=deploy)
-        self.pw = RepPW1x1(dim, use_aux=use_aux, use_residual=use_residual, deploy=deploy)
+        if use_mpcr:
+            self.pw = MPCRPW1x1(dim, groups=mpcr_groups, mode=mpcr_mode,
+                                use_aux=use_aux, use_residual=use_residual, deploy=deploy)
+        else:
+            self.pw = RepPW1x1(dim, use_aux=use_aux, use_residual=use_residual, deploy=deploy)
         self.act = nn.SiLU()
 
     def forward(self, x):
@@ -51,11 +64,13 @@ class DCRDecoder(nn.Module):
     branches to fuse1+fuse2 (high2 = both L and H branches).
     """
 
-    def __init__(self, dim=160, use_aux=True, use_residual=True, nscr_scope="none", deploy=False):
+    def __init__(self, dim=160, use_aux=True, use_residual=True, nscr_scope="none",
+                 deploy=False, use_mpcr=False, mpcr_mode="multi2", mpcr_groups=4):
         super().__init__()
         self.dim = dim
         self.use_aux = use_aux
         self.nscr_scope = nscr_scope
+        self.use_mpcr = use_mpcr
         self.act = nn.SiLU()
         mode = NSCR_MODES.get(nscr_scope, "none")
 
@@ -75,7 +90,10 @@ class DCRDecoder(nn.Module):
         self.block2 = RepLocalBlock(dim, use_aux=use_aux, use_residual=use_residual, deploy=deploy)
         self.block1 = RepLocalBlock(dim, use_aux=use_aux, use_residual=use_residual, deploy=deploy)
 
-        self.refine = RepLocalBlock(dim, use_aux=use_aux, use_residual=use_residual, deploy=deploy)
+        # Run8 MPCR-Fine: only the final refine block gets the MPCR pointwise.
+        self.refine = RepLocalBlock(dim, use_aux=use_aux, use_residual=use_residual,
+                                    deploy=deploy, use_mpcr=use_mpcr,
+                                    mpcr_mode=mpcr_mode, mpcr_groups=mpcr_groups)
 
     def forward(self, feats):
         t1, t2, t3, t4 = feats

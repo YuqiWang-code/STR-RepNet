@@ -504,3 +504,119 @@ class PBRUHead(nn.Module):
             if hasattr(self, name):
                 delattr(self, name)
         return self
+
+
+# -----------------------------------------------------------------------------
+# Run8 MPCR-Fine: Multi-Partition Channel Reparameterization (refine.pw only)
+# -----------------------------------------------------------------------------
+def make_interleaved_permutation(channels, groups):
+    """Interleaved partition: perm = arange(D).view(groups, D//groups).t().reshape(-1).
+
+    D=160, g=4 -> [0,40,80,120, 1,41,81,121, ...]  (cross-partition interleaved).
+    """
+    return torch.arange(channels).view(groups, channels // groups).t().reshape(-1)
+
+
+def invert_permutation(p):
+    inv = torch.empty_like(p)
+    inv[p] = torch.arange(len(p), device=p.device)
+    return inv
+
+
+def group1x1_to_dense_fp64(w_group, groups):
+    """Embed a grouped-1x1 folded weight (D, D//g, 1, 1) into a dense FP64 matrix
+    (D, D, 1, 1): output channel o belongs to group k = o//(D//g) and connects only
+    input channels [k*q, (k+1)*q); all other entries are exactly 0."""
+    w = w_group.detach().double()
+    D = w.shape[0]
+    q = w.shape[1]
+    assert D % groups == 0 and q == D // groups
+    dense = torch.zeros(D, D, 1, 1, dtype=torch.float64, device=w.device)
+    k = torch.arange(D, device=w.device) // q            # group id per output channel
+    jj = torch.arange(q, device=w.device)
+    abs_in = (k.view(D, 1) * q + jj.view(1, q)).reshape(-1)  # (D*q,) input channel ids
+    rows = torch.arange(D, device=w.device).view(D, 1).expand(D, q).reshape(-1)
+    dense[rows, abs_in, 0, 0] = w.reshape(-1)
+    return dense
+
+
+class MPCRPW1x1(nn.Module):
+    """Run8 MPCR-Fine pointwise block (refine.pw only).
+
+    Train graph:
+        Y = RepPW1x1(X) + P0^-1 BN0( G0(P0 X) ) + P1^-1 BN1( G1(P1 X) )
+    where G0/G1 are grouped 1x1 convs (same params/groups), P0 = identity and
+    P1 = identity (mode="same2") or the interleaved permutation (mode="multi2").
+    Both branches are zero-init (BN gamma=beta=0) -> epoch-0 output is EXACTLY
+    the Run2 core output. At deploy everything is absorbed into the single dense
+    1x1 via W_j = P_j^-1 W~_j P_j (FP64 composition, one FP32 cast).
+
+    Deploy graph == Run2 refine.pw: dense Conv2d(D -> D, 1, bias=True), +0 cost.
+    """
+
+    def __init__(self, channels, groups=4, mode="multi2", use_aux=True,
+                 use_residual=True, deploy=False):
+        super().__init__()
+        self.channels = channels
+        self.groups = groups
+        self.mode = mode if mode in ("same2", "multi2") else "multi2"
+        self.use_aux = use_aux
+        self.use_residual = use_residual
+        self.deploy = deploy
+        assert channels % groups == 0
+        if deploy:
+            self.pw = nn.Conv2d(channels, channels, 1, bias=True)
+        else:
+            self.core = RepPW1x1(channels, use_aux=use_aux, use_residual=use_residual)
+            self.g0 = nn.Conv2d(channels, channels, 1, groups=groups, bias=False)
+            self.bn0 = nn.BatchNorm2d(channels)
+            self.g1 = nn.Conv2d(channels, channels, 1, groups=groups, bias=False)
+            self.bn1 = nn.BatchNorm2d(channels)
+            nn.init.kaiming_normal_(self.g0.weight, mode="fan_out", nonlinearity="relu")
+            nn.init.kaiming_normal_(self.g1.weight, mode="fan_out", nonlinearity="relu")
+            for bn in (self.bn0, self.bn1):
+                nn.init.zeros_(bn.weight)
+                nn.init.zeros_(bn.bias)
+            p0 = torch.arange(channels)
+            p1 = p0 if self.mode == "same2" else make_interleaved_permutation(channels, groups)
+            self.register_buffer("perm0", p0, persistent=False)
+            self.register_buffer("perm1", p1, persistent=False)
+            self.register_buffer("inv0", invert_permutation(p0), persistent=False)
+            self.register_buffer("inv1", invert_permutation(p1), persistent=False)
+
+    def forward(self, x):
+        if self.deploy:
+            return self.pw(x)
+        y = self.core(x)
+        y = y + self.bn0(self.g0(x[:, self.perm0]))[:, self.inv0]
+        y = y + self.bn1(self.g1(x[:, self.perm1]))[:, self.inv1]
+        return y
+
+    def get_equivalent_kernel_bias(self):
+        """FP64: W_eq = W_core + P0^-1 W~0 P0 + P1^-1 W~1 P1 (same for b)."""
+        W, b = self.core.get_equivalent_kernel_bias()   # (D, D, 1, 1), (D,) FP64
+        for g, bn, inv in ((self.g0, self.bn0, self.inv0),
+                           (self.g1, self.bn1, self.inv1)):
+            Wg, bg = fold_conv_bn(g.weight, None, bn)   # (D, D//g, 1, 1) FP64
+            Wd = group1x1_to_dense_fp64(Wg, self.groups)
+            W = W + Wd[inv][:, inv]
+            b = b + bg[inv]
+        return W, b
+
+    def branch_stats(self):
+        s = {"p0_gamma": self.bn0.weight.norm().item(), "p1_gamma": self.bn1.weight.norm().item(),
+             "g0_w": self.g0.weight.norm().item(), "g1_w": self.g1.weight.norm().item()}
+        return s
+
+    def switch_to_deploy(self):
+        if self.deploy:
+            return self
+        kernel, bias = self.get_equivalent_kernel_bias()
+        self.pw = nn.Conv2d(self.channels, self.channels, 1, bias=True)
+        self.pw.weight.data = kernel.float()
+        self.pw.bias.data = bias.float()
+        self.deploy = True
+        for name in ("core", "g0", "g1", "bn0", "bn1"):
+            if hasattr(self, name):
+                delattr(self, name)
+        return self

@@ -124,6 +124,9 @@ class Trainer(object):
             head_mode=self.args.head_mode,
             use_pbru=bool(self.args.use_pbru),
             pbru_upscale=self.args.pbru_upscale,
+            use_mpcr=bool(self.args.use_mpcr),
+            mpcr_mode=self.args.mpcr_mode,
+            mpcr_groups=self.args.mpcr_groups,
             patch_size=v.PATCH_SIZE,
             in_chans=v.IN_CHANS,
             num_classes=config.MODEL.NUM_CLASSES,
@@ -294,6 +297,12 @@ class Trainer(object):
             if "pbru_coarse_gamma" in st:
                 self.log(f"[PBRU-GAMMA-NORM] coarse={st['pbru_coarse_gamma']:.4e} "
                          f"px={st['pbru_px_gamma']:.4e} py={st['pbru_py_gamma']:.4e} pxy={st['pbru_pxy_gamma']:.4e}")
+        # MPCR branch diagnostics (before folding; not used for checkpoint selection)
+        if self.args.use_mpcr:
+            st = getattr(self.model.decoder.refine.pw, "branch_stats", lambda: None)() or {}
+            if "p0_gamma" in st:
+                self.log(f"[MPCR-GAMMA-NORM] p0={st['p0_gamma']:.4e} p1={st['p1_gamma']:.4e} "
+                         f"(g0_w={st['g0_w']:.4e} g1_w={st['g1_w']:.4e})")
 
         ref_pre = torch.randn(1, 3, self.args.crop_size, self.args.crop_size).cuda()
         ref_post = torch.randn(1, 3, self.args.crop_size, self.args.crop_size).cuda()
@@ -328,6 +337,9 @@ class Trainer(object):
         self.log(f"[HEAD-MODE] {self.args.head_mode}")
         self.log(f"[PBRU] {int(self.args.use_pbru)}")
         self.log(f"[DECODER-DIM] {self.args.decoder_dim}")
+        self.log(f"[MPCR] {int(self.args.use_mpcr)}")
+        self.log(f"[MPCR-MODE] {self.args.mpcr_mode}")
+        self.log(f"[MPCR-GROUPS] {self.args.mpcr_groups}")
         self.log(f"[ENCODER-TRAIN] {self.args.encoder_train}")
         self.log(f"[TEMPORAL-SWAP-PROB] {self.args.temporal_swap_prob}")
         self.log(f"[TOTAL-TRAIN-GRAPH-PARAMS] {fmt_params(train_total)} M")
@@ -385,6 +397,9 @@ def main():
     parser.add_argument('--head_mode', type=str, default='bilinear', choices=['bilinear', 'pixelshuffle'])
     parser.add_argument('--use_pbru', type=int, default=0)
     parser.add_argument('--pbru_upscale', type=int, default=4)
+    parser.add_argument('--use_mpcr', type=int, default=0)
+    parser.add_argument('--mpcr_mode', type=str, default='multi2', choices=['same2', 'multi2'])
+    parser.add_argument('--mpcr_groups', type=int, default=4)
     parser.add_argument('--num_workers', type=int, default=8)
     parser.add_argument('--seed', type=int, default=2333)
     parser.add_argument('--resume', type=str, default=None)
@@ -398,6 +413,14 @@ def main():
         parser.error("--use_pbru cannot combine with --use_nscr/--use_botr (Run7 attribution)")
     if args.head_mode == "pixelshuffle" and args.pbru_upscale != 4:
         parser.error("--pbru_upscale must be 4 (decoder 64x64 -> 256x256)")
+    # Run8 config guards: MPCR only on the Run2-deploy anchor config (bilinear D160).
+    if args.use_mpcr:
+        if args.head_mode != "bilinear" or args.decoder_dim != 160:
+            parser.error("--use_mpcr requires --head_mode bilinear and --decoder_dim 160 (Run8)")
+        if args.use_pbru or args.use_nscr or args.use_botr:
+            parser.error("--use_mpcr cannot combine with pbru/nscr/botr (Run8 attribution)")
+        if args.mpcr_groups != 4:
+            parser.error("--mpcr_groups must be 4 (pre-registered; no sweep)")
 
     if args.gpu >= 0:
         torch.cuda.set_device(args.gpu)
