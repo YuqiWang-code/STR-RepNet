@@ -200,7 +200,7 @@ Run2 在 Run1 基础上做了两处改造（部署图/参数/FLOPs 完全不变�
 
 - **主方案 MPCR-Fine**（Fine-stage Multi-Partition Channel Reparameterization）：Run7 归因证明输出侧已榨干 → 转向 fine-stage 表征。只在 `refine.pw` 加两个同参数量 grouped 1×1 训练分支（groups=4），C0=两个连续分区（容量控制）、M1=连续+交织互补分区；BN γ=β=0 零初始化保证 epoch-0 输出与 Run2 逐位一致，部署经 `W_eq = W_core + P0⁻¹W̃0P0 + P1⁻¹W̃1P1` 解析折叠回原 dense PW（`--use_mpcr`，部署 +0 参数/FLOPs）。
 - 预训练门槛全部通过（GPU0）：T0 置换/嵌入精确（P⁻¹GP 2.1e-14）；T1 折叠 4.8~6.0e-06 + FP64 代数 ~7e-15；T2 全模型 5.9~8.8e-05、argmax 全 0；冒烟 epoch-0 与 Run2 **逐位一致**（max_diff=0.0）、部署 Params/FLOPs 与锚点精确相等；**预算机器验证 D\*=160、ΔParams=ΔFLOPs=0**（28.828706M / 12.6062G）；LEVIR 2-epoch dry run 双通过。
-- Phase 1（进行中，GPU0 并行）：**C0_MPCR_Same2 + M1_MPCR_Multi2** × LEVIR（300 epoch，last2，D=160，bilinear）。判据沿用 PASS/WEAK/FAIL 体系；rep 归因 = M1−C0（≥+0.15pp 且精度不降超 0.15pp 才算 rep-supported）；§18 继续/停止逻辑（WEAK/FAIL 不扩、不 sweep、不救机制）。
+- Phase 1（进行中，GPU0 并行 4 job）：**C0_MPCR_Same2 + M1_MPCR_Multi2** × **LEVIR + WHU**（300 epoch，last2，D=160，bilinear；WHU 为容量驱动启动、先于 §18 gate，结果仅在 LEVIR 过 gate 后参与扩展裁决）。判据沿用 PASS/WEAK/FAIL 体系；rep 归因 = M1−C0（≥+0.15pp 且精度不降超 0.15pp 才算 rep-supported）；§18 继续/停止逻辑（WEAK/FAIL 不扩、不 sweep、不救机制）。
 - 设计文档：[`docs/temporary/STR-RepNet_Run8_MPCR-Fine_设计与实验方案.md`](docs/temporary/STR-RepNet_Run8_MPCR-Fine_设计与实验方案.md)；`train_scripts/TAR-DCR/Run8/README.md`。
 
 ## 参考文献

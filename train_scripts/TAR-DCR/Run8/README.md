@@ -46,9 +46,11 @@ Run7 归因结论：PixelShuffle 拓扑数据集敏感（LEVIR +0.12pp / WHU −
 - 公共：`rep_mode=full / D=160 / bilinear / last2 / use_residual=1 / botr=nscr=pbru=0 /
   seed=2333 / 300 epoch / batch 16 / lr 1e-4 / lovasz 2.0`；C0/M1 训练期参数、分支数、groups、
   部署图**完全相同**，唯一变量 = branch1 的 channel partition。
-- WHU/SYSU/CDD 脚本已预写，**仅过 gate 后**按 WHU→SYSU→CDD 启动（§18/§19）。
+- **GPU0 并行（用户指令）**：C0+M1 的 LEVIR 与 WHU 共 4 job 并行（~28G/32.6G）。注意 WHU 属于
+  容量驱动启动、先于 §18 gate；WHU 结果照常记录，但仅在 LEVIR 过 gate（18-A/B）后才参与扩展裁决。
+- SYSU/CDD 脚本已预写，**仅过 gate 后**按 SYSU→CDD 启动（§18/§19）。
 - 说明：设计文档 §26 建议 C0 跑 GPU0、M1 跑 GPU1；按本机实际分配（GPU1 属其他课题），
-  **两组都跑 GPU0**（2 job 并行，各 ~6.8G）。
+  **全部跑 GPU0**。
 
 ## 预注册判据（LEVIR，锚点 F1=0.9144 / IoU=0.8424 / Precision=0.9260）
 
