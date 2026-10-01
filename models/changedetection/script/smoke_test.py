@@ -9,10 +9,11 @@ Run8 additions: --use_mpcr checks (MPCR only on refine.pw, BN zero-init,
 epoch-0 output EXACTLY equal to use_mpcr=0, group-conv/gamma gradients non-zero,
 deploy branch deletion, deploy Params/FLOPs EXACTLY equal to the anchor).
 Run10 additions: --use_pfdr checks (PFDRDW5 only on decoder t1 before fuse1,
-aux conv/BN zero-init, C0/M1 main-branch init identical + epoch-0 logits
-bitwise equal, aux BN gamma grads non-zero + aux conv grads after gamma nudge,
-deploy = single DW5, C0/M1 deploy Params/FLOPs identical, optional anchor
-budget check at D* via --check_anchor).
+aux BN zero-init (epoch-0 aux output exactly 0; aux convs stay Kaiming),
+C0/M1 main-branch init identical + epoch-0 logits bitwise equal, aux BN gamma
+grads non-zero + aux conv grads after gamma nudge, deploy = single DW5, C0/M1
+deploy Params/FLOPs identical, optional anchor budget check at D* via
+--check_anchor).
 """
 import copy
 import os
@@ -157,12 +158,14 @@ def main():
         assert model.decoder.pfdr_scope == "fine1"
         assert model.decoder.use_pfdr is True
         if args.pfdr_mode == "rep":
-            for name in ("dw3", "dwd2", "dw1"):
-                assert getattr(p, name).weight.abs().sum().item() == 0.0, f"{name} must be zero-init"
+            # aux CONVs keep Kaiming init (zero conv weights would deadlock the
+            # BN gamma gradient); zero epoch-0 output comes from BN gamma=beta=0.
             for name in ("bn3", "bnd2", "bn1"):
                 b = getattr(p, name)
                 assert b.weight.abs().sum().item() == 0.0 and b.bias.abs().sum().item() == 0.0
-        print("  PFDR zero-init OK (aux conv weights=0, aux BN gamma=beta=0)")
+            for name in ("dw3", "dwd2", "dw1"):
+                assert getattr(p, name).weight.abs().sum().item() > 0.0, f"{name} must be Kaiming-init"
+        print("  PFDR zero-init OK (aux BN gamma=beta=0; aux convs Kaiming-init)")
 
     # encoder train mode per encoder_train
     enc_trainable = sum(p.numel() for p in model.encoder.parameters() if p.requires_grad)

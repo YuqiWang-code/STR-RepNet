@@ -640,7 +640,7 @@ def embed_3x3_d2_5x5(w):
 def embed_1x1_center_5x5(w):
     """(D,1,1,1) -> (D,1,5,5): E_1(K)[:,:,2,2] = K."""
     out = torch.zeros(w.shape[0], 1, 5, 5, dtype=w.dtype, device=w.device)
-    out[:, :, 2, 2] = w
+    out[:, :, 2, 2] = w[:, :, 0, 0]
     return out
 
 
@@ -649,17 +649,22 @@ class PFDRDW5(nn.Module):
 
     Train graph (mode="rep"):
         Y = BN5(DW5x5(X)) + BN3(DW3x3(X)) + BNd2(DW3x3(d=2)(X)) + BN1(DW1x1(X)) + alpha*X
-    aux convs are zero-init and aux BNs have gamma=beta=0, so the epoch-0 aux
-    output is EXACTLY 0 and M1 starts from the plain main-branch prediction.
+    aux BNs have gamma=beta=0, so the epoch-0 aux output is EXACTLY 0 and M1
+    starts from the plain main-branch prediction. IMPORTANT: the aux CONVs keep
+    Kaiming init (NOT zero): with zero conv weights the aux branch output is
+    constant 0, its normalized activation x_hat is 0, and the BN gamma gradient
+    stays 0 forever (deadlock) — Kaiming init keeps x_hat non-zero so gamma
+    receives a gradient at init (conv grads then flow after gamma departs 0).
     Deploy graph (both modes): single DW5x5 (groups=D, padding=2, bias=True);
     all branches are composed in FP64 and cast to FP32 exactly once.
 
     mode="plain" (C0): only the main DW5+BN (+alpha residual) — deploy graph
     is IDENTICAL to mode="rep" (M1), so M1-C0 isolates the rep effect.
 
-    NOTE (RNG): nn.Conv2d construction consumes RNG even for immediately-zeroed
-    weights, so this module MUST be attached AFTER all other RNG-consuming
-    constructions (Run9-style) for the C0/M1 epoch-0 bitwise identity to hold.
+    NOTE (RNG): nn.Conv2d construction consumes RNG even when the weights are
+    subsequently overwritten, so this module MUST be attached AFTER all other
+    RNG-consuming constructions (Run9-style) for the C0/M1 epoch-0 bitwise
+    identity to hold.
     """
 
     def __init__(self, channels, mode="rep", use_alpha=True, deploy=False):
@@ -682,7 +687,7 @@ class PFDRDW5(nn.Module):
                 self.dw1 = nn.Conv2d(channels, channels, 1, 1, 0, groups=channels, bias=False)
                 self.bn1 = nn.BatchNorm2d(channels)
                 for c in (self.dw3, self.dwd2, self.dw1):
-                    nn.init.zeros_(c.weight)
+                    nn.init.kaiming_normal_(c.weight, mode="fan_out", nonlinearity="relu")
                 for bn in (self.bn3, self.bnd2, self.bn1):
                     nn.init.zeros_(bn.weight)
                     nn.init.zeros_(bn.bias)
