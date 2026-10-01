@@ -242,7 +242,7 @@ def main():
                 for b in (1, 2, 3):
                     sel = (cbf == b) | (cbf == 0)
                     acc[(k, b)]["s"].append(f[sel].double() @ w_lda[(k, b)])
-                    acc[(k, b)]["y"].append(cbf[sel] == b)
+                    acc[(k, b)]["y"].append(torch.from_numpy(cbf[sel] == b).cuda())
         return {(k, b): roc_auc(torch.cat(acc[(k, b)]["s"]), torch.cat(acc[(k, b)]["y"]))
                 for k in STAGES for b in (1, 2, 3)}
 
