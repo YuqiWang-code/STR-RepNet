@@ -59,6 +59,28 @@ Run8 MPCR-Fine FAIL 后，按导师式决策：**Run9 是最后一次正交结�
 - 机制记录标签：`[BIFTR-DELTA-NORM] / [BIFTR-EFFECTIVE-UPDATE-NORM] / [BIFTR-CROSS-TERM-RATIO]`
   （交叉项比率用于判断双侧乘性耦合是否真的被利用，不用于挑 checkpoint）。
 
+## 实验结果（LEVIR + WHU，已完成）—— M1 FAIL，结构搜索结束
+
+| exp | 数据集 | F1 | Recall | Precision | IoU | ΔF1 vs A0 | M1−C0 |
+|---|---|---|---|---|---|---|---|
+| C0_FTR_Post | LEVIR | 0.9142 | 0.9042 | 0.9243 | 0.8419 | −0.02pp | — |
+| M1_BiFTR | LEVIR | **0.9147** | 0.9037 | 0.9260 | 0.8428 | **+0.03pp** | **≈+0.05pp（边界）** |
+| C0_FTR_Post | WHU | 0.9496 | 0.9394 | 0.9601 | 0.9040 | −0.18pp | — |
+| M1_BiFTR | WHU | 0.9506 | 0.9390 | 0.9625 | 0.9059 | −0.08pp | +0.10pp |
+
+- **M1/LEVIR = FAIL**（F1 0.9147 < 失败线 0.9159，Precision 0.9260 达标但 F1 不过线）；
+  rep 归因落在 not-supported/weak 边界（M1−C0 ≈ +0.05pp，Precision +0.17pp）。
+  硬条件全程合格（28.829M / 12.6062G、argmax=0、fold ~6.7e-05）。
+- 权重空间记录（M1 LEVIR）：‖Δin‖F=0.67、‖Δout‖F=1.21、有效更新范数 0.131（相对核变化 13%）、
+  **交叉项比率 5.65%** —— 双侧乘性耦合确实被利用了，但净效应中性（Recall −0.05pp /
+  Precision +0.17pp，又现"置信度锐化"签名）。
+- **§22-A / 预注册裁决：结束结构搜索**。Run9 是最后一次正交结构尝试（encoder 侧串行乘性
+  重参数化），未达 PASS → **不设计 Run10**，进入论文收尾（doc §33）：
+  清理主方法（TAR+DCR+BN-FR，Run2）、统一 Params/FLOPs、部署误差记录、train/deploy 图、
+  组织 Run1–Run9 证据（正文保留 NSCR/PBRU/MPCR/BiFTR 最有信息量的负结果）、
+  方法冻结后补 3-seed × 4 数据集正式稳定性。
+- 完整汇总见 `outputs/TAR-DCR/Run9/_SUMMARY.md`。
+
 ## 机制分析工具
 
 `analyse/levir_biftr_profile.py`：hook pre_transition / transition_pre_norm /

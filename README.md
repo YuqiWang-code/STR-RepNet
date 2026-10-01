@@ -40,7 +40,7 @@ Lightweight Spatial-Temporal Structural Re-parameterization Network for Remote S
 - **NSCR-Fuse**（Run6 迭代，已按判据停止）：`DCRDecoder` 的 fuse1+fuse2 加零初始化原生尺度 BN 分支（`BN_L(L)` + `U(BN_H(H))`），利用逐通道仿射与 bilinear 插值可交换性，部署时吸收回原 cross-scale 1×1（`--use_nscr`，部署 +0 参数/FLOPs）
 - **PBRU**（Run7 迭代，已按判据 WEAK 归档）：Phase-Basis Reparameterized Upsampling 输出头——部署为单个 `Conv2d(D→C·r²,1)` + `PixelShuffle(r)`（全分辨率、无插值）；训练期叠加 4 个零初始化相位基分支 `{1,u,v,u·v}`（BN γ=β=0），FP64 解析折叠吸收（`--head_mode pixelshuffle --use_pbru 1`，部署 +0 参数/FLOPs vs 纯 PixelShuffle，经 D\*=158 预算搜索与 Run2 部署预算持平）
 - **MPCR-Fine**（Run8 迭代，已按判据 FAIL 停止）：Fine-stage Multi-Partition Channel Reparameterization——`refine.pw` 加两个同参数量零初始化 grouped 1×1 分支（groups=4，连续/交织互补分区），`W_eq = W_core + Σ P⁻¹W̃P` 解析折叠回原 dense PW（`--use_mpcr`，部署 +0 参数/FLOPs，预算机器验证 D\*=160、Δ=0）
-- **BiFTR**（Run9 迭代，最后一次结构搜索）：Bi-sided Frozen-to-Trainable Transition Reparameterization——包装 `encoder.layers[1].downsample` 的 192→384 stride-2 Conv（frozen stage2→trainable stage3 边界），训练期 `y=(I+Δout)W((I+Δin)x)`（Δ 零初始化 1×1，base 冻结），部署 `W_eq=AWB、b_eq=Ab` 折叠回原单个 Conv（`--use_biftr`，部署 +0 参数/FLOPs，预算 equality audit Δ=0）
+- **BiFTR**（Run9 迭代，最后一次结构搜索，已按判据 FAIL 结束）：Bi-sided Frozen-to-Trainable Transition Reparameterization——包装 `encoder.layers[1].downsample` 的 192→384 stride-2 Conv（frozen stage2→trainable stage3 边界），训练期 `y=(I+Δout)W((I+Δin)x)`（Δ 零初始化 1×1，base 冻结），部署 `W_eq=AWB、b_eq=Ab` 折叠回原单个 Conv（`--use_biftr`，部署 +0 参数/FLOPs，预算 equality audit Δ=0）
 
 - 模型入口：`models/changedetection/models/STRRepNet.py`（`STRRepNet`）
 - 核心文件：`reparam.py`（代数折叠原语）、`tar.py`（二时相 bridge）、`dcr_decoder.py`（多尺度解码器）
@@ -214,12 +214,25 @@ Run2 在 Run1 基础上做了两处改造（部署图/参数/FLOPs 完全不变�
   按 §18-E **停止 MPCR，不救机制**；SYSU/CDD 不启动；硬条件全程合格（预算内、argmax=0）。
 - 设计文档：[`docs/temporary/STR-RepNet_Run8_MPCR-Fine_设计与实验方案.md`](docs/temporary/STR-RepNet_Run8_MPCR-Fine_设计与实验方案.md)；`train_scripts/TAR-DCR/Run8/README.md`。
 
-## 实验结果（Run9：BiFTR，进行中 —— 最后一次结构搜索）
+## 实验结果（Run9：BiFTR，已完成 —— M1 FAIL，结构搜索结束）
 
 - **主方案 BiFTR**（Bi-sided Frozen-to-Trainable Transition Reparameterization）：位置离开 decoder，取 `encoder.layers[1].downsample` 的 192→384 stride-2 Conv（`last2` 下唯一的 frozen→trainable 边界）；训练期 `y=(I+Δout)W((I+Δin)x)`（Δ 零初始化 1×1，base 冻结；C0=仅 post，M1=双侧），部署 `W_eq=AWB、b_eq=Ab` 折叠回原单个 Conv（+0 部署）。参数化家族 = 串行乘性双侧 basis（含 ΔoutWΔin 交叉项），非并行 additive branch。
-- 预训练门槛全部通过（GPU0）：T0 AWB FP64 代数 1.71e-10（192/384 维 GEMM 纯 FP64 累加，相对 ~5e-13；阈值 1e-9）；T1 折叠 post 7.9e-06 / bi 8.3e-06 + FP64 代数 ~1e-14；T2 全模型 post 6.2e-05 / bi 8.4e-05、argmax 全 0；冒烟 epoch-0 与 Run2 **逐位一致**（max_diff=0.0）、Δ 梯度 @init 非零且 base grad=None、部署 Params/FLOPs 与锚点精确相等；**预算 equality audit C0/M1 ΔParams=ΔFLOPs=0**。
-- 事实修正：本仓库配置 `downsample_version=v3`（k3 s2 p1，非文档假设的 k2）；AWB 折叠与 kernel 尺寸无关，assert 只锁定 192→384+stride2 的冻训边界身份，骨干算子原样保留。
-- Phase 1（进行中，GPU0 并行 4 job）：**C0_FTR_Post + M1_BiFTR** × **LEVIR + WHU**（300 epoch，last2，D=160，bilinear；WHU 为容量驱动启动、先于 §19 gate，结果仅在 LEVIR 过 gate 后参与扩展裁决）。判据沿用 PASS/WEAK/FAIL 体系；rep 归因 = M1−C0；**WEAK/FAIL → 结束结构搜索、进入论文收尾（不再设计 Run10）**。
+- 预训练门槛全部通过（GPU0）：T0 AWB FP64 代数 1.71e-10；T1 折叠 post 7.9e-06 / bi 8.3e-06 + FP64 代数 ~1e-14；T2 全模型 post 6.2e-05 / bi 8.4e-05、argmax 全 0；冒烟 epoch-0 与 Run2 **逐位一致**（max_diff=0.0）；**预算 equality audit C0/M1 ΔParams=ΔFLOPs=0**。
+- 结果（LEVIR + WHU，GPU0 并行 4 job）：
+
+  | exp | LEVIR F1 | WHU F1 | ΔF1 vs A0 |
+  |---|---|---|---|
+  | C0_FTR_Post | 0.9142 | 0.9496 | −0.02 / −0.18pp |
+  | M1_BiFTR | **0.9147** | 0.9506 | **+0.03 / −0.08pp** |
+
+- **M1/LEVIR = FAIL**（0.9147 < 0.9159），rep 归因在 not-supported/weak 边界（M1−C0 ≈ +0.05pp，
+  Precision +0.17pp）。权重空间：‖Δ‖ 学到 0.67/1.21、核相对变化 13%、**交叉项比率 5.65%**
+  —— 双侧乘性耦合确实被利用，但净效应中性（Recall −0.05pp / Precision +0.17pp，
+  第三次出现"置信度锐化"签名）。硬条件全程合格（预算内、argmax=0、fold 6.7e-05）。
+- **§22-A 预注册裁决：结束结构搜索**——Run9 是最后一次正交结构尝试（encoder 侧串行乘性
+  重参数化），未达 PASS → **不设计 Run10**，进入论文收尾（doc §33）：清理主方法
+  （TAR+DCR+BN-FR，Run2）、统一 Params/FLOPs 与部署误差、train/deploy 图、组织 Run1–Run9
+  证据（正文保留最有信息量的负结果）、方法冻结后补 3-seed × 4 数据集正式稳定性。
 - 设计文档：[`docs/temporary/STR-RepNet_Run9_BiFTR_设计与实验方案.md`](docs/temporary/STR-RepNet_Run9_BiFTR_设计与实验方案.md)；`train_scripts/TAR-DCR/Run9/README.md`。
 
 ## 参考文献
