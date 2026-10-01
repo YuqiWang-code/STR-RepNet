@@ -387,16 +387,28 @@ def test_pfdr_embedding_algebra():
     b1 = torch.randn(D, dtype=torch.float64)
     alpha = torch.randn(1, dtype=torch.float64)
 
-    # embedding unit tests (must be exact)
+    # embedding unit tests (exact structure via torch.equal on slices; zero-region
+    # sums are exactly 0. NOTE: no whole-tensor sum equalities — CUDA tree
+    # reductions differ in the last ulp across shapes)
     e3 = embed_3x3_center_5x5(K3)
-    assert torch.equal(e3[:, :, 1:4, 1:4], K3) and e3.abs().sum() == K3.abs().sum()
+    assert torch.equal(e3[:, :, 1:4, 1:4], K3), "3x3 center embedding mismatch"
+    assert e3[:, :, 0, :].abs().sum().item() == 0.0
+    assert e3[:, :, 4, :].abs().sum().item() == 0.0
+    assert e3[:, :, :, 0].abs().sum().item() == 0.0
+    assert e3[:, :, :, 4].abs().sum().item() == 0.0
     e_d = embed_3x3_d2_5x5(Kd)
-    assert torch.equal(e_d[:, :, 0::2, 0::2], Kd) and e_d.abs().sum() == Kd.abs().sum()
+    assert torch.equal(e_d[:, :, 0::2, 0::2], Kd), "dilation-2 embedding mismatch"
+    assert e_d[:, :, 1::2, 1::2].abs().sum().item() == 0.0
+    assert e_d[:, :, 0::2, 1::2].abs().sum().item() == 0.0
+    assert e_d[:, :, 1::2, 0::2].abs().sum().item() == 0.0
     e1 = embed_1x1_center_5x5(K1)
-    assert torch.equal(e1[:, :, 2, 2], K1[:, :, 0, 0]) and e1.abs().sum() == K1.abs().sum()
+    assert torch.equal(e1[:, :, 2, 2], K1[:, :, 0, 0]), "1x1 center embedding mismatch"
+    border = e1.clone()
+    border[:, :, 2, 2] = 0
+    assert border.abs().sum().item() == 0.0
     ident = identity_dw_kernel(D, 5, dtype=torch.float64)
-    assert torch.equal(ident[:, 0, 2, 2], torch.ones(D, dtype=torch.float64)) \
-        and ident.abs().sum() == D
+    assert torch.equal(ident[:, 0, 2, 2], torch.ones(D, dtype=torch.float64))
+    assert ident.sum().item() == float(D)
     print("[OK] PFDR embeddings exact (3x3 center / dilation-2 sparse / 1x1 center / identity)")
 
     y_direct = (F.conv2d(x, K5, b5, padding=2, groups=D)

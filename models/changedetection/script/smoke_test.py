@@ -316,9 +316,11 @@ def main():
         args_plain = argparse.Namespace(**{**vars(args), "pfdr_mode": "plain"})
         m_plain = build_model(args_plain, config).cuda()
         # main branch init identical
+        pr = dict(m_rep.decoder.prefuse1.named_parameters())
+        pl = dict(m_plain.decoder.prefuse1.named_parameters())
         for n in ("dw5.weight", "bn5.weight", "bn5.bias", "alpha"):
-            a = getattr(m_rep.decoder.prefuse1, n).detach()
-            b = getattr(m_plain.decoder.prefuse1, n).detach()
+            a = pr[n].detach()
+            b = pl[n].detach()
             assert torch.equal(a, b), f"PFDR main-branch init differs: {n}"
         # every non-PFDR shared weight identical (encoder/tar/decoder/head)
         sd_rep = m_rep.state_dict()
