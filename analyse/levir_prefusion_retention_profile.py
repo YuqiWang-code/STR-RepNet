@@ -236,14 +236,13 @@ def main():
         acc = {(k, b): {"s": [], "y": []} for k in STAGES for b in (1, 2, 3)}
         for i in range(lo, hi):
             outs, cb = forward_sample(i)
+            cbf = cb.reshape(-1)
             for k in STAGES:
                 f = outs[k][0].permute(1, 2, 0).reshape(-1, D)
                 for b in (1, 2, 3):
-                    pos = (cb == b).reshape(-1)
-                    neg = (cb == 0).reshape(-1)
-                    sel = pos | neg
+                    sel = (cbf == b) | (cbf == 0)
                     acc[(k, b)]["s"].append(f[sel].double() @ w_lda[(k, b)])
-                    acc[(k, b)]["y"].append((cb[sel] == b))
+                    acc[(k, b)]["y"].append(cbf[sel] == b)
         return {(k, b): roc_auc(torch.cat(acc[(k, b)]["s"]), torch.cat(acc[(k, b)]["y"]))
                 for k in STAGES for b in (1, 2, 3)}
 
