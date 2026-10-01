@@ -24,10 +24,16 @@ dominant GT component covering the cell):
 
 Usage (on server):
     python analyse/levir_prefusion_retention_profile.py \
-        --cfg <vssm yaml> --checkpoint <Run2 LEVIR best_F1 pth> \
+        --cfg <vssm yaml> --checkpoint <best_F1 pth> \
         --dataset_root /share_datasets/CD/LEVIR-CD-256 \
         --train_list .../list/train.txt --test_list .../list/test.txt \
         --output_dir <dir> [--max_samples 200] [--gpu 0]
+
+Run10 post-training: pass --use_pfdr 1 --pfdr_mode plain|rep --decoder_dim 158 to
+profile the C0/M1 checkpoints (t1 hook then captures the POST-PFDR fine
+lateral, so t1 vs fuse1/block1/refine measures whether the pre-fusion stage
+itself is now the separable one). Defaults (0/rep/160) reproduce the Run2
+anchor profile (Phase -1).
 """
 import argparse
 import json
@@ -61,11 +67,12 @@ BIN_NAMES = {1: "small", 2: "medium", 3: "large"}
 def build_model(args, config):
     v = config.MODEL.VSSM
     return STRRepNet(
-        pretrained=None, rep_mode="full", dim=160, use_residual=True,
+        pretrained=None, rep_mode="full", dim=args.decoder_dim, use_residual=True,
         encoder_train="last2", use_botr=False, use_nscr=False, nscr_scope="high2",
         head_mode="bilinear", use_pbru=False, pbru_upscale=4,
         use_mpcr=False, mpcr_mode="multi2", mpcr_groups=4,
-        use_biftr=False, biftr_mode="bi", use_pfdr=False, pfdr_mode="rep",
+        use_biftr=False, biftr_mode="bi",
+        use_pfdr=bool(args.use_pfdr), pfdr_mode=args.pfdr_mode,
         patch_size=v.PATCH_SIZE, in_chans=v.IN_CHANS, num_classes=config.MODEL.NUM_CLASSES,
         depths=v.DEPTHS, dims=v.EMBED_DIM,
         ssm_d_state=v.SSM_D_STATE, ssm_ratio=v.SSM_RATIO, ssm_rank_ratio=v.SSM_RANK_RATIO,
@@ -137,6 +144,9 @@ def main():
     ap.add_argument("--test_list", type=str, required=True)
     ap.add_argument("--output_dir", type=str, required=True)
     ap.add_argument("--max_samples", type=int, default=200)
+    ap.add_argument("--use_pfdr", type=int, default=0)
+    ap.add_argument("--pfdr_mode", type=str, default="rep", choices=["plain", "rep"])
+    ap.add_argument("--decoder_dim", type=int, default=160)
     ap.add_argument("--gpu", type=int, default=0)
     args = ap.parse_args()
     for attr, val in [("opts", None), ("batch_size", 16), ("data_path", ""), ("zip", False),
