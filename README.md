@@ -244,14 +244,28 @@ Run2 在 Run1 基础上做了两处改造（部署图/参数/FLOPs 完全不变�
   「参数化函数类」真正不同的方向。
 - **主方案 PFDR**（Pre-Fusion Dilated Re-parameterization）：最细尺度 `t1` 在 `fuse1`
   跨尺度混合**之前**过可部署 DW5×5；训练期 `DW5+DW3+DW3(d=2)+DW1+α·I` 多尺度 depthwise
-  basis（aux 零初始化），部署解析折叠为单个 DW5（FP64、一次 FP32 cast）。针对 Run6 的
-  small-object FN（24% 完全漏检）——「先保真/扩域空间细节，再混合语义」，与前三类失败
-  参数化家族（channel basis / phase basis / serial multiplicative）正交。
+  basis（aux BN γ=β=0 零初始化、aux conv 保持 Kaiming 防梯度死锁），部署解析折叠为单个
+  DW5（FP64、一次 FP32 cast）。针对 Run6 的 small-object FN（24% 完全漏检）——「先保真/扩域
+  空间细节，再混合语义」，与前三类失败参数化家族（channel basis / phase basis / serial
+  multiplicative）正交。
 - **消融**：A0 = Run2 full_last2（不重跑）；C0 = plain pre-fusion DW5（deploy 拓扑对照）；
   M1 = 多分支训练 / 单 DW5 部署。**C0 与 M1 deploy graph 完全相同**，归因
   Topology=C0−A0、Rep=M1−C0、System=M1−A0。
-- **预算**：DW5 约 +4.2K 参数，用解码器宽度 D\* 搜索回收（`analyse/search_run10_pfdr_budget.py`，
-  D=160↓152；预注册 gate：D\*≥158 才训练）。
+- **Phase -1 保留度诊断（已完成，先验降级为探索性）**：冻结 Run2 解码器下，
+  t1 的小/中/大目标 held-out diag-LDA AUROC（0.862/0.880/0.874）**低于**融合后
+  fuse1（0.952/0.969/0.936）——静态证据不支持「融合前细节被稀释」；按 doc §6.2
+  不取消 Run10，但机制先验从较强降为探索性（冻结状态静态观察的固有局限，
+  训练期端到端可重塑 t1，由 C0/M1 裁决）。bins 复现 Run6（small ≤502px / medium ≤868px）。
+  详见 `outputs/diagnostics/Run10_PFDR/phase1_retention/prefusion_retention_profile.json`。
+- **预训练门槛（Phase 0，全部通过）**：
+  - smoke：C0/M1 main-init 一致 + epoch-0 logits 逐位一致（max_diff=0.0）；aux γ 梯度
+    非零 @init + γ nudge 后 aux conv 梯度出现；部署仅剩单个 DW5；argmax=0；C0/M1 部署
+    Params/FLOPs 相同；
+  - 等价性：T0 嵌入精确 + FP64 多分支代数 2.1e-14（<1e-10）；T1 plain 1.4e-06 / rep
+    2.9e-06（<2e-5）+ FP64 代数 ~4e-15；T2 全模型 plain 9.9e-05 / rep 5.8e-05（<2e-4）、
+    argmax=0；历史全套（BOTR/NSCR/PBRU/MPCR/BiFTR）回归全过；
+  - **预算搜索 D\*=158**（28.817956M / 12.6028G ≤ 锚点 28.828706M / 12.6062G；
+    D=159 FLOPs 仍超 +0.0065G；C0/M1 deploy 精确相等；D\*≥158 gate 通过，与 Run7 一致）。
 - **判据（LEVIR）**：PASS = M1 F1≥0.9200 & IoU≥0.8520 & Precision≥0.9230 & M1−C0≥+0.15pp
   & 预算/argmax 合格；TARGET-HIT = F1≥0.9250（项目硬目标）；FAIL = F1<0.9159 或
   Precision<0.9220 或 M1−C0<+0.05pp 或硬门槛失败。WEAK/FAIL 不 sweep。PASS 才扩
