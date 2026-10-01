@@ -43,7 +43,10 @@ Run8 MPCR-Fine FAIL 后，按导师式决策：**Run9 是最后一次正交结�
 
 - 公共：`rep_mode=full / last2 / D=160 / bilinear / use_residual=1 / botr=nscr=pbru=mpcr=0 /
   seed=2333 / 300 epoch / batch 16 / lr 1e-4 / lovasz 2.0`。
-- WHU/SYSU/CDD 脚本已预写，**仅当 M1 PASS 且 M1−C0 ≥ +0.05pp 后才启动 WHU**（§19）。
+- **GPU0 并行（用户指令）**：C0+M1 的 LEVIR 与 WHU 共 4 job 并行（~27.5G/32.6G）。注意 WHU 属于
+  容量驱动启动、先于 §19 gate；WHU 结果照常记录，但仅在 LEVIR 过 gate（M1 PASS 且
+  M1−C0≥+0.05pp）后才参与扩展裁决。
+- SYSU/CDD 脚本已预写，**仅过 gate 后**按 SYSU→CDD 启动（§19/§20）。
 
 ## 预注册判据（LEVIR）
 

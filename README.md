@@ -219,7 +219,7 @@ Run2 在 Run1 基础上做了两处改造（部署图/参数/FLOPs 完全不变�
 - **主方案 BiFTR**（Bi-sided Frozen-to-Trainable Transition Reparameterization）：位置离开 decoder，取 `encoder.layers[1].downsample` 的 192→384 stride-2 Conv（`last2` 下唯一的 frozen→trainable 边界）；训练期 `y=(I+Δout)W((I+Δin)x)`（Δ 零初始化 1×1，base 冻结；C0=仅 post，M1=双侧），部署 `W_eq=AWB、b_eq=Ab` 折叠回原单个 Conv（+0 部署）。参数化家族 = 串行乘性双侧 basis（含 ΔoutWΔin 交叉项），非并行 additive branch。
 - 预训练门槛全部通过（GPU0）：T0 AWB FP64 代数 1.71e-10（192/384 维 GEMM 纯 FP64 累加，相对 ~5e-13；阈值 1e-9）；T1 折叠 post 7.9e-06 / bi 8.3e-06 + FP64 代数 ~1e-14；T2 全模型 post 6.2e-05 / bi 8.4e-05、argmax 全 0；冒烟 epoch-0 与 Run2 **逐位一致**（max_diff=0.0）、Δ 梯度 @init 非零且 base grad=None、部署 Params/FLOPs 与锚点精确相等；**预算 equality audit C0/M1 ΔParams=ΔFLOPs=0**。
 - 事实修正：本仓库配置 `downsample_version=v3`（k3 s2 p1，非文档假设的 k2）；AWB 折叠与 kernel 尺寸无关，assert 只锁定 192→384+stride2 的冻训边界身份，骨干算子原样保留。
-- Phase 1（进行中，GPU0）：**C0_FTR_Post + M1_BiFTR** × LEVIR（300 epoch，last2，D=160，bilinear）。判据沿用 PASS/WEAK/FAIL 体系；rep 归因 = M1−C0；WHU 仅在 M1 PASS 且 M1−C0≥+0.05pp 后启动；**WEAK/FAIL → 结束结构搜索、进入论文收尾（不再设计 Run10）**。
+- Phase 1（进行中，GPU0 并行 4 job）：**C0_FTR_Post + M1_BiFTR** × **LEVIR + WHU**（300 epoch，last2，D=160，bilinear；WHU 为容量驱动启动、先于 §19 gate，结果仅在 LEVIR 过 gate 后参与扩展裁决）。判据沿用 PASS/WEAK/FAIL 体系；rep 归因 = M1−C0；**WEAK/FAIL → 结束结构搜索、进入论文收尾（不再设计 Run10）**。
 - 设计文档：[`docs/temporary/STR-RepNet_Run9_BiFTR_设计与实验方案.md`](docs/temporary/STR-RepNet_Run9_BiFTR_设计与实验方案.md)；`train_scripts/TAR-DCR/Run9/README.md`。
 
 ## 参考文献
