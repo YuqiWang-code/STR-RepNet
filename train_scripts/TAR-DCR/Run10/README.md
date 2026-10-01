@@ -33,7 +33,9 @@ PFDR 写成结构重参数化创新。
       C0/M1 deploy 精确相等；gate D\*≥158 通过）
 - [x] smoke@D\* 锚点预算检查（deploy ≤ Run2 锚点）✅
 - [x] T2 全模型（plain 9.9e-05 / rep 5.8e-05 <2e-4）、argmax=0；历史回归全过
-- [ ] LEVIR C0/M1 各 2-epoch dry run（loss 有限、PFDR 梯度/折叠正常）——进行中
+- [x] LEVIR C0/M1 各 2-epoch dry run ✅（loss 有限：Total 0.44→0.31；M1 aux γ 2 epoch 已学到非零：
+      near3=4.7e-2 / dilated3=5.8e-2 / center1=3.2e-2；TEST 块正常；正式训练从 last.pth 自动续训）
+- [x] LEVIR C0/M1 300-epoch 正式训练已启动（GPU0 两 job，watcher 监控中）
 
 ## Phase -1 保留度诊断（已完成，先验降级）
 
