@@ -36,6 +36,7 @@ def build_model(args, config):
         nscr_scope=args.nscr_scope, head_mode=args.head_mode,
         use_pbru=bool(args.use_pbru), pbru_upscale=args.pbru_upscale,
         use_mpcr=bool(args.use_mpcr), mpcr_mode=args.mpcr_mode, mpcr_groups=args.mpcr_groups,
+        use_biftr=bool(args.use_biftr), biftr_mode=args.biftr_mode,
         patch_size=v.PATCH_SIZE, in_chans=v.IN_CHANS, num_classes=config.MODEL.NUM_CLASSES,
         depths=v.DEPTHS, dims=v.EMBED_DIM,
         ssm_d_state=v.SSM_D_STATE, ssm_ratio=v.SSM_RATIO, ssm_rank_ratio=v.SSM_RANK_RATIO,
@@ -69,6 +70,8 @@ def main():
     ap.add_argument('--use_mpcr', type=int, default=0)
     ap.add_argument('--mpcr_mode', type=str, default='multi2', choices=['same2', 'multi2'])
     ap.add_argument('--mpcr_groups', type=int, default=4)
+    ap.add_argument('--use_biftr', type=int, default=0)
+    ap.add_argument('--biftr_mode', type=str, default='bi', choices=['post', 'bi'])
     ap.add_argument('--gpu', type=int, default=0)
     args = ap.parse_args()
 
@@ -115,6 +118,28 @@ def main():
             assert b.weight.abs().sum().item() == 0.0 and b.bias.abs().sum().item() == 0.0
         print("  MPCR zero-init OK (bn0/bn1 weight=bias=0; MPCR only on refine.pw)")
 
+    if args.use_biftr:
+        # wrapper located exactly at layers[1].downsample[1], 192->384 k2 s2
+        b = model.biftr
+        assert b is not None and b.__class__.__name__ == "BiFTRTransition"
+        assert model.encoder.layers[1].downsample[1] is b, "wrapper must replace downsample[1]"
+        c = b.conv
+        assert c.in_channels == 192 and c.out_channels == 384
+        assert c.stride == (2, 2)
+        print(f"  BiFTR target conv: {c.in_channels}->{c.out_channels}, k={c.kernel_size}, s={c.stride}")
+        # freeze states: base frozen, deltas trainable
+        assert not c.weight.requires_grad, "base downsample Conv must stay frozen"
+        assert b.d_out.weight.requires_grad, "d_out must be trainable"
+        if args.biftr_mode == "bi":
+            assert b.d_in.weight.requires_grad, "d_in must be trainable"
+        else:
+            assert not hasattr(b, "d_in"), "post mode must not have d_in"
+        # zero-init
+        assert b.d_out.weight.abs().sum().item() == 0.0
+        if hasattr(b, "d_in"):
+            assert b.d_in.weight.abs().sum().item() == 0.0
+        print("  BiFTR OK (192->384 stride-2 wrapped; base frozen; deltas trainable + zero-init)")
+
     # encoder train mode per encoder_train
     enc_trainable = sum(p.numel() for p in model.encoder.parameters() if p.requires_grad)
     model.train()
@@ -124,8 +149,12 @@ def main():
     elif args.encoder_train == 'last2':
         s12 = sum(p.numel() for i in (0, 1) for p in model.encoder.layers[i].parameters() if p.requires_grad)
         s34 = sum(p.numel() for i in (2, 3) for p in model.encoder.layers[i].parameters() if p.requires_grad)
+        if args.use_biftr and model.biftr is not None:
+            # BiFTR deltas live in layers[1] and are train-only; exclude them from
+            # the frozen-stage accounting.
+            s12 -= sum(p.numel() for p in model.biftr.parameters() if p.requires_grad)
         assert s12 == 0 and s34 > 0
-        print(f"  encoder last2 OK (stage1+2 trainable={s12}, stage3+4 trainable={s34})")
+        print(f"  encoder last2 OK (stage1+2 trainable={s12} excl. biftr deltas, stage3+4 trainable={s34})")
 
     print("[2/6] forward pass ...")
     model.eval()
@@ -223,6 +252,38 @@ def main():
             assert g is not None and g.abs().sum().item() > 0, f"{name} weight grad must be non-zero after gamma nudge"
         print("  MPCR gamma grads non-zero @init + group-conv grads non-zero after gamma nudge: OK")
 
+    if args.use_biftr:
+        print("[2g/6] BiFTR epoch-0 identity vs use_biftr=0 ...")
+        torch.manual_seed(2333)
+        m_a = build_model(args, config).cuda()
+        torch.manual_seed(2333)
+        args_b0 = argparse.Namespace(**{**vars(args), "use_biftr": 0})
+        m_b = build_model(args_b0, config).cuda()
+        # zero-init deltas consume no RNG, so all shared weights match exactly.
+        m_a.eval()
+        m_b.eval()
+        with torch.no_grad():
+            oa = m_a(pre, post)
+            ob = m_b(pre, post)
+        d = (oa - ob).abs().max().item()
+        assert d == 0.0, f"BiFTR epoch-0 output must equal Run2 EXACTLY, got {d}"
+        print(f"  BiFTR epoch-0 output == Run2 output exactly (max_diff={d})")
+
+        print("[2h/6] BiFTR gradient flow ...")
+        m_grad = copy.deepcopy(model)
+        m_grad.train()
+        out_g = m_grad(pre, post)
+        loss = torch.nn.functional.cross_entropy(out_g, torch.randint(0, 2, (2, 256, 256)).cuda())
+        loss.backward()
+        b = m_grad.biftr
+        assert b.conv.weight.grad is None, "base Conv must receive no grad"
+        g = b.d_out.weight.grad
+        assert g is not None and g.abs().sum().item() > 0, "d_out grad must be non-zero"
+        if hasattr(b, "d_in"):
+            g = b.d_in.weight.grad
+            assert g is not None and g.abs().sum().item() > 0, "d_in grad must be non-zero"
+        print("  BiFTR grads OK (deltas non-zero @init, base conv grad=None)")
+
     print("[3/6] deploy fold ...")
     deploy = copy.deepcopy(model)
     deploy.switch_to_deploy()
@@ -236,6 +297,11 @@ def main():
     has_mpcr = any(("g0" in k or "g1" in k or "bn0" in k or "bn1" in k
                     or ".core." in k) for k in sd_keys)
     assert not has_mpcr, "deploy graph must not contain g0/g1/bn0/bn1/core"
+    has_biftr = any(("d_in" in k or "d_out" in k) for k in sd_keys)
+    assert not has_biftr, "deploy graph must not contain d_in/d_out"
+    if args.use_biftr:
+        # deploy graph must be exactly one downsample Conv (wrapper folded)
+        assert deploy.biftr.deploy, "BiFTR wrapper must be in deploy mode"
     with torch.no_grad():
         out_d = deploy(pre, post)
     err = (out - out_d).abs().max().item()
@@ -313,6 +379,29 @@ def main():
             c_0, _ = flop_count(deploy0, (pre, post), supported_ops=supported)
         f_n, f_0 = sum(c_n.values()), sum(c_0.values())
         print(f"  deploy FLOPs mpcr={f_n:.4f} vs anchor={f_0:.4f} (batch2)")
+        assert f_n == f_0, "deploy FLOPs must be EXACTLY the Run2 anchor"
+        print(f"  deploy Params/FLOPs EXACTLY equal to the Run2 anchor: OK ({deploy_params/1e6:.3f} M)")
+    elif args.use_biftr:
+        # deploy params / FLOPs must be EXACTLY the Run2 anchor (use_biftr=0, last2, D160)
+        args0 = argparse.Namespace(**{**vars(args), "use_biftr": 0})
+        model0 = build_model(args0, config).cuda()
+        deploy0 = copy.deepcopy(model0)
+        deploy0.switch_to_deploy()
+        deploy0.eval()
+        p0 = sum(p.numel() for p in deploy0.parameters())
+        assert p0 == deploy_params, f"deploy params differ: biftr={deploy_params} vs anchor={p0}"
+        from fvcore.nn import flop_count
+        from classification.models.vmamba import selective_scan_flop_jit
+        supported = {
+            "prim::PythonOp.SelectiveScanMamba": selective_scan_flop_jit,
+            "prim::PythonOp.SelectiveScanOflex": selective_scan_flop_jit,
+            "prim::PythonOp.SelectiveScanCore": selective_scan_flop_jit,
+        }
+        with torch.no_grad():
+            c_n, _ = flop_count(deploy, (pre, post), supported_ops=supported)
+            c_0, _ = flop_count(deploy0, (pre, post), supported_ops=supported)
+        f_n, f_0 = sum(c_n.values()), sum(c_0.values())
+        print(f"  deploy FLOPs biftr={f_n:.4f} vs anchor={f_0:.4f} (batch2)")
         assert f_n == f_0, "deploy FLOPs must be EXACTLY the Run2 anchor"
         print(f"  deploy Params/FLOPs EXACTLY equal to the Run2 anchor: OK ({deploy_params/1e6:.3f} M)")
     else:

@@ -34,12 +34,19 @@ use_mpcr (Run8): refine.pw becomes MPCRPW1x1 — two zero-init grouped-1x1 BN
     branches (identity + identity|interleaved partition) absorbed into the original
     dense PW at deploy via P^-1 G P (+0 deploy Params/FLOPs). mpcr_mode in
     {"same2", "multi2"}, mpcr_groups fixed 4.
+
+use_biftr (Run9): BiFTR — wraps the frozen stage2->trainable stage3 downsample
+    Conv (192->384, stride 2; actual config v3: k3 s2 p1) as
+    y = (I+d_out) W ((I+d_in) x). d_in/d_out are zero-init 1x1 convs
+    (train-only; base Conv stays frozen). Deploy folds W_eq = A W B, b_eq = A b
+    back into the single original Conv (+0 deploy). biftr_mode in {"post","bi"}:
+    post = d_out only (C0_FTR_Post), bi = both (M1_BiFTR).
 """
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from changedetection.models.Mamba_backbone import Backbone_VSSM
+from changedetection.models.Mamba_backbone import Backbone_VSSM, install_biftr_transition
 from changedetection.models.tar import MultiScaleTAR
 from changedetection.models.dcr_decoder import DCRDecoder
 from changedetection.models.reparam import PBRUHead
@@ -50,7 +57,7 @@ class STRRepNet(nn.Module):
                  encoder_train="frozen", use_botr=False, use_nscr=False,
                  nscr_scope="high2", head_mode="bilinear", use_pbru=False,
                  pbru_upscale=4, use_mpcr=False, mpcr_mode="multi2", mpcr_groups=4,
-                 **encoder_kwargs):
+                 use_biftr=False, biftr_mode="bi", **encoder_kwargs):
         super().__init__()
         self.rep_mode = rep_mode
         self.dim = dim
@@ -65,6 +72,9 @@ class STRRepNet(nn.Module):
         self.use_mpcr = use_mpcr
         self.mpcr_mode = mpcr_mode
         self.mpcr_groups = int(mpcr_groups)
+        self.use_biftr = use_biftr
+        self.biftr_mode = biftr_mode
+        self.biftr = None
 
         self.encoder = Backbone_VSSM(out_indices=(0, 1, 2, 3), pretrained=pretrained, **encoder_kwargs)
         self._setup_encoder_train()
@@ -85,6 +95,21 @@ class STRRepNet(nn.Module):
                                  use_phase_rep=use_pbru)
         else:
             self.head = nn.Conv2d(dim, 2, 1)
+
+        # Run9 BiFTR: install AFTER all RNG-consuming constructions. nn.Conv2d
+        # creation draws RNG for its (immediately zeroed) init, so installing
+        # earlier would shift the shared-init RNG stream and break the epoch-0
+        # bitwise identity with use_biftr=0. The wrapper's home layers[1] is
+        # frozen by last2; the train-only deltas are re-enabled here while the
+        # base Conv stays frozen.
+        if use_biftr:
+            self.biftr = install_biftr_transition(self.encoder, mode=biftr_mode,
+                                                  transition="stage2_to_stage3")
+            self.biftr.conv.requires_grad_(False)
+            if hasattr(self.biftr, "d_in"):
+                self.biftr.d_in.requires_grad_(True)
+            if hasattr(self.biftr, "d_out"):
+                self.biftr.d_out.requires_grad_(True)
 
     def _setup_encoder_train(self):
         for p in self.encoder.parameters():
@@ -124,6 +149,8 @@ class STRRepNet(nn.Module):
 
     @torch.no_grad()
     def switch_to_deploy(self):
+        if self.biftr is not None:
+            self.biftr.switch_to_deploy()
         self.tar.switch_to_deploy()
         self.decoder.switch_to_deploy()
         if isinstance(self.head, PBRUHead):

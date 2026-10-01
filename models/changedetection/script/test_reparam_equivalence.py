@@ -25,6 +25,16 @@ Run8 additions (MPCR-Fine):
   - T1: MPCRPW1x1 (same2 + multi2) fold, FP32 tol=2e-5, non-trivial branches
     (conv std 0.05, BN gamma std 0.5) + FP64 algebra vs manual composition;
   - T2: whole-model fold with use_mpcr (same2/multi2), tol=2e-4, argmax=0.
+
+Run9 additions (BiFTR):
+  - T0: FP64 A(W(Bx)+b) == (AWB)x + Ab on the ACTUAL v3 downsample conv
+    (k3 s2 p1; the fold is kernel-size-agnostic). FP64 tol 1e-9: 192/384-dim
+    GEMMs at O(100) magnitudes give ~1.7e-10 pure-FP64 accumulation
+    (relative ~5e-13);
+  - T1: BiFTRTransition (post/bi) fold, FP32 tol=2e-5, non-trivial deltas
+    (std 0.05) + FP64 algebra (1e-9, same reason);
+  - T2: whole-model fold with use_biftr (post/bi, encoder_train=last2),
+    tol=2e-4, argmax=0, freeze-state asserts (base frozen, deltas trainable).
 """
 import argparse
 import copy
@@ -32,6 +42,7 @@ import os
 import sys
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
 _MODELS_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -42,6 +53,7 @@ from changedetection.models.reparam import (RepDW3, RepPW1x1, RepPairFuse1x1, NS
                                             PBRUHead, build_phase_basis, fold_conv_bn,
                                             MPCRPW1x1, make_interleaved_permutation,
                                             invert_permutation, group1x1_to_dense_fp64)
+from changedetection.models.Mamba_backbone import BiFTRTransition
 from changedetection.models.tar import TemporalRep1x1, TARStage, MultiScaleTAR
 from changedetection.models.dcr_decoder import RepLocalBlock, DCRDecoder
 
@@ -271,6 +283,78 @@ def mpcr_block_tests(device):
     return ok
 
 
+def test_biftr_algebra():
+    """T0 (Run9): FP64 A( W(Bx) + b ) == (AWB)x + Ab (stride-2 downsample conv).
+
+    Tolerance 1e-10: with random A/B/W of std 1 and 192/384-dim channel GEMMs
+    the intermediate magnitudes are O(100); measured FP64 error ~9e-11
+    (relative ~1e-13) is pure GEMM accumulation, not a fold error.
+    """
+    torch.manual_seed(0)
+    Ci, Co = 192, 384
+    W = torch.randn(Co, Ci, 3, 3, dtype=torch.float64)  # v3 downsample k3 s2 p1
+    b = torch.randn(Co, dtype=torch.float64)
+    A = torch.randn(Co, Co, dtype=torch.float64)
+    B = torch.randn(Ci, Ci, dtype=torch.float64)
+    x = torch.randn(1, Ci, 32, 32, dtype=torch.float64)
+    xb = torch.einsum("ni,bihw->bnhw", B, x)
+    z = F.conv2d(xb, W, b, stride=2, padding=1)
+    y_direct = torch.einsum("om,bmhw->bohw", A, z)
+    W_pre = torch.einsum("mnxy,ni->mixy", W, B)
+    W_eq = torch.einsum("om,mixy->oixy", A, W_pre)
+    b_eq = A @ b
+    y_fold = F.conv2d(x, W_eq, b_eq, stride=2, padding=1)
+    err = (y_direct - y_fold).abs().max().item()
+    assert err < 1e-9, f"BiFTR AWB algebra error {err}"
+    print(f"[{'OK' if err < 1e-9 else 'FAIL'}] BiFTR A(W(Bx)+b) == (AWB)x + Ab (FP64): {err:.3e}")
+    return True
+
+
+def biftr_block_tests(device):
+    """T1 (Run9): BiFTRTransition fold (FP32 tol=2e-5, non-trivial deltas) + FP64 algebra.
+
+    FP64 algebra tol 1e-10: 192/384-dim channel GEMMs at O(100) magnitudes give
+    ~1e-11 pure-FP64 accumulation (relative ~1e-13), cf. T0.
+    """
+    torch.manual_seed(2333)
+    x = torch.randn(2, 192, 32, 32, device=device)
+    ok = True
+    for mode in ("post", "bi"):
+        base = nn.Conv2d(192, 384, 3, 2, 1, bias=True).to(device)  # v3 downsample
+        h = BiFTRTransition(base, mode=mode).to(device)
+        with torch.no_grad():
+            h.d_out.weight.normal_(0.0, 0.05)
+            if hasattr(h, "d_in"):
+                h.d_in.weight.normal_(0.0, 0.05)
+        h.eval()
+        with torch.no_grad():
+            y0 = h(x)
+        h2 = copy.deepcopy(h)
+        h2.switch_to_deploy()
+        h2.eval()
+        with torch.no_grad():
+            y1 = h2(x)
+        err = (y0 - y1).abs().max().item()
+        ok &= err < 2e-5
+        assert not any(("d_in" in k or "d_out" in k) for k in h2.state_dict().keys()), \
+            "deploy BiFTRTransition must be delta-free"
+        print(f"[{'OK' if err < 2e-5 else 'FAIL'}] BiFTRTransition({mode}) fold: max_abs_error={err:.3e}")
+
+        W, b = h.get_equivalent_kernel_bias()
+        assert W.dtype == torch.float64 and b.dtype == torch.float64
+        with torch.no_grad():
+            y_alg = F.conv2d(x.double(), W, b, stride=2, padding=1)
+            xb = x.double()
+            if mode == "bi":
+                xb = xb + F.conv2d(xb, h.d_in.weight.double())
+            z = F.conv2d(xb, h.conv.weight.double(), h.conv.bias.double(), stride=2, padding=1)
+            y2 = z + F.conv2d(z, h.d_out.weight.double())
+        err64 = (y_alg - y2).abs().max().item()
+        ok &= err64 < 1e-9
+        print(f"[{'OK' if err64 < 1e-9 else 'FAIL'}] BiFTRTransition({mode}) fold algebra (FP64): {err64:.3e}")
+    return ok
+
+
 def block_tests(device):
     torch.manual_seed(2333)
     C = 160
@@ -309,7 +393,8 @@ def block_tests(device):
 
 def whole_model_test(device, cfg, pretrained, rep_mode="full", use_botr=False,
                      use_nscr=False, nscr_scope="high2", head_mode="bilinear",
-                     use_pbru=False, pbru_upscale=4, use_mpcr=False, mpcr_mode="multi2"):
+                     use_pbru=False, pbru_upscale=4, use_mpcr=False, mpcr_mode="multi2",
+                     encoder_train="frozen", use_biftr=False, biftr_mode="bi"):
     from changedetection.configs.config import get_config
     from changedetection.models.STRRepNet import STRRepNet
 
@@ -326,6 +411,7 @@ def whole_model_test(device, cfg, pretrained, rep_mode="full", use_botr=False,
         use_nscr=use_nscr, nscr_scope=nscr_scope, head_mode=head_mode,
         use_pbru=use_pbru, pbru_upscale=pbru_upscale,
         use_mpcr=use_mpcr, mpcr_mode=mpcr_mode, mpcr_groups=4,
+        encoder_train=encoder_train, use_biftr=use_biftr, biftr_mode=biftr_mode,
         patch_size=v.PATCH_SIZE, in_chans=v.IN_CHANS, num_classes=config.MODEL.NUM_CLASSES,
         depths=v.DEPTHS, dims=v.EMBED_DIM,
         ssm_d_state=v.SSM_D_STATE, ssm_ratio=v.SSM_RATIO, ssm_rank_ratio=v.SSM_RANK_RATIO,
@@ -338,12 +424,27 @@ def whole_model_test(device, cfg, pretrained, rep_mode="full", use_botr=False,
         patchembed_version=v.PATCHEMBED, gmlp=v.GMLP, use_checkpoint=config.TRAIN.USE_CHECKPOINT,
     ).to(device)
 
-    # verify encoder is frozen
+    # verify encoder freeze state per encoder_train
     enc_trainable = sum(p.numel() for p in model.encoder.parameters() if p.requires_grad)
-    assert enc_trainable == 0, f"encoder has {enc_trainable} trainable params"
+    s12 = sum(p.numel() for i in (0, 1) for p in model.encoder.layers[i].parameters() if p.requires_grad)
+    s34 = sum(p.numel() for i in (2, 3) for p in model.encoder.layers[i].parameters() if p.requires_grad)
+    if encoder_train == "frozen":
+        assert enc_trainable == 0, f"encoder has {enc_trainable} trainable params"
+    else:
+        if use_biftr and model.biftr is not None:
+            s12 -= sum(p.numel() for p in model.biftr.parameters() if p.requires_grad)
+        assert s12 == 0 and s34 > 0, f"last2: stage1/2 frozen, stage3/4 trainable (s12={s12}, s34={s34})"
     model.train()
-    assert model.encoder.training is False, "encoder should stay eval after model.train()"
-    print(f"[OK] encoder frozen (trainable={enc_trainable}, training={model.encoder.training})")
+    if encoder_train == "frozen":
+        assert model.encoder.training is False, "encoder should stay eval after model.train()"
+    if use_biftr:
+        b = model.biftr
+        assert not b.conv.weight.requires_grad, "BiFTR base Conv must stay frozen"
+        assert b.d_out.weight.requires_grad, "BiFTR d_out must be trainable"
+        if biftr_mode == "bi":
+            assert b.d_in.weight.requires_grad, "BiFTR d_in must be trainable"
+    print(f"[OK] encoder state (trainable={enc_trainable}, s12={s12}, s34={s34}, "
+          f"training={model.encoder.training})")
 
     # PBRU branches are zero-init by design; perturb the head so the fold is non-trivial.
     if head_mode == "pixelshuffle":
@@ -359,6 +460,12 @@ def whole_model_test(device, cfg, pretrained, rep_mode="full", use_botr=False,
                 bn.bias.normal_(0.0, 0.5)
                 bn.running_mean.normal_()
                 bn.running_var.uniform_(0.5, 2.0)
+    # BiFTR deltas are zero-init by design; perturb so the fold is non-trivial.
+    if use_biftr:
+        with torch.no_grad():
+            model.biftr.d_out.weight.normal_(0.0, 0.05)
+            if hasattr(model.biftr, "d_in"):
+                model.biftr.d_in.weight.normal_(0.0, 0.05)
 
     model.eval()
     torch.manual_seed(2333)  # deterministic inputs for reproducible argmax check
@@ -378,7 +485,7 @@ def whole_model_test(device, cfg, pretrained, rep_mode="full", use_botr=False,
     ok = err < 2e-4
     print(f"[{'OK' if ok else 'FAIL'}] STRRepNet whole model ({rep_mode}, botr={use_botr}, "
           f"nscr={use_nscr}/{nscr_scope}, head={head_mode}, pbru={use_pbru}, "
-          f"mpcr={use_mpcr}/{mpcr_mode}): "
+          f"mpcr={use_mpcr}/{mpcr_mode}, biftr={use_biftr}/{biftr_mode}, enc={encoder_train}): "
           f"max_abs_error={err:.3e}, argmax_disagree={disagree:.3e}")
     return ok
 
@@ -407,10 +514,14 @@ def main():
     print("=== MPCR permutation + dense embedding (T0, exact) ===")
     t0m_ok = test_mpcr_permutation_algebra()
 
+    print("=== BiFTR AWB algebra (T0, exact) ===")
+    t0b_ok = test_biftr_algebra()
+
     print("=== block-level fold tests (tol=2e-5; FP64-composed kernels) ===")
     b_ok = block_tests(device)
     p_ok = pbru_head_tests(device)
     pm_ok = mpcr_block_tests(device)
+    pb_ok = biftr_block_tests(device)
 
     print("=== whole-model fold tests (error recorded; FP32 graphs, tol=2e-4) ===")
     w_ok = whole_model_test(device, args.cfg, args.pretrained_weight_path, args.rep_mode)
@@ -425,9 +536,14 @@ def main():
                               use_mpcr=True, mpcr_mode="same2")
     wmm_ok = whole_model_test(device, args.cfg, args.pretrained_weight_path, args.rep_mode,
                               use_mpcr=True, mpcr_mode="multi2")
+    wbp_ok = whole_model_test(device, args.cfg, args.pretrained_weight_path, args.rep_mode,
+                              encoder_train="last2", use_biftr=True, biftr_mode="post")
+    wbb_ok = whole_model_test(device, args.cfg, args.pretrained_weight_path, args.rep_mode,
+                              encoder_train="last2", use_biftr=True, biftr_mode="bi")
 
-    all_ok = (c_ok and t0_ok and t0m_ok and b_ok and p_ok and pm_ok
-              and w_ok and wb_ok and wn_ok and wp_ok and wq_ok and wms_ok and wmm_ok)
+    all_ok = (c_ok and t0_ok and t0m_ok and t0b_ok and b_ok and p_ok and pm_ok and pb_ok
+              and w_ok and wb_ok and wn_ok and wp_ok and wq_ok and wms_ok and wmm_ok
+              and wbp_ok and wbb_ok)
     print(f"\n{'ALL PASSED' if all_ok else 'SOME FAILED'}")
     sys.exit(0 if all_ok else 1)
 

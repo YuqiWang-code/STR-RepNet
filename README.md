@@ -40,6 +40,7 @@ Lightweight Spatial-Temporal Structural Re-parameterization Network for Remote S
 - **NSCR-Fuse**（Run6 迭代，已按判据停止）：`DCRDecoder` 的 fuse1+fuse2 加零初始化原生尺度 BN 分支（`BN_L(L)` + `U(BN_H(H))`），利用逐通道仿射与 bilinear 插值可交换性，部署时吸收回原 cross-scale 1×1（`--use_nscr`，部署 +0 参数/FLOPs）
 - **PBRU**（Run7 迭代，已按判据 WEAK 归档）：Phase-Basis Reparameterized Upsampling 输出头——部署为单个 `Conv2d(D→C·r²,1)` + `PixelShuffle(r)`（全分辨率、无插值）；训练期叠加 4 个零初始化相位基分支 `{1,u,v,u·v}`（BN γ=β=0），FP64 解析折叠吸收（`--head_mode pixelshuffle --use_pbru 1`，部署 +0 参数/FLOPs vs 纯 PixelShuffle，经 D\*=158 预算搜索与 Run2 部署预算持平）
 - **MPCR-Fine**（Run8 迭代，已按判据 FAIL 停止）：Fine-stage Multi-Partition Channel Reparameterization——`refine.pw` 加两个同参数量零初始化 grouped 1×1 分支（groups=4，连续/交织互补分区），`W_eq = W_core + Σ P⁻¹W̃P` 解析折叠回原 dense PW（`--use_mpcr`，部署 +0 参数/FLOPs，预算机器验证 D\*=160、Δ=0）
+- **BiFTR**（Run9 迭代，最后一次结构搜索）：Bi-sided Frozen-to-Trainable Transition Reparameterization——包装 `encoder.layers[1].downsample` 的 192→384 stride-2 Conv（frozen stage2→trainable stage3 边界），训练期 `y=(I+Δout)W((I+Δin)x)`（Δ 零初始化 1×1，base 冻结），部署 `W_eq=AWB、b_eq=Ab` 折叠回原单个 Conv（`--use_biftr`，部署 +0 参数/FLOPs，预算 equality audit Δ=0）
 
 - 模型入口：`models/changedetection/models/STRRepNet.py`（`STRRepNet`）
 - 核心文件：`reparam.py`（代数折叠原语）、`tar.py`（二时相 bridge）、`dcr_decoder.py`（多尺度解码器）
@@ -213,6 +214,14 @@ Run2 在 Run1 基础上做了两处改造（部署图/参数/FLOPs 完全不变�
   按 §18-E **停止 MPCR，不救机制**；SYSU/CDD 不启动；硬条件全程合格（预算内、argmax=0）。
 - 设计文档：[`docs/temporary/STR-RepNet_Run8_MPCR-Fine_设计与实验方案.md`](docs/temporary/STR-RepNet_Run8_MPCR-Fine_设计与实验方案.md)；`train_scripts/TAR-DCR/Run8/README.md`。
 
+## 实验结果（Run9：BiFTR，进行中 —— 最后一次结构搜索）
+
+- **主方案 BiFTR**（Bi-sided Frozen-to-Trainable Transition Reparameterization）：位置离开 decoder，取 `encoder.layers[1].downsample` 的 192→384 stride-2 Conv（`last2` 下唯一的 frozen→trainable 边界）；训练期 `y=(I+Δout)W((I+Δin)x)`（Δ 零初始化 1×1，base 冻结；C0=仅 post，M1=双侧），部署 `W_eq=AWB、b_eq=Ab` 折叠回原单个 Conv（+0 部署）。参数化家族 = 串行乘性双侧 basis（含 ΔoutWΔin 交叉项），非并行 additive branch。
+- 预训练门槛全部通过（GPU0）：T0 AWB FP64 代数 1.71e-10（192/384 维 GEMM 纯 FP64 累加，相对 ~5e-13；阈值 1e-9）；T1 折叠 post 7.9e-06 / bi 8.3e-06 + FP64 代数 ~1e-14；T2 全模型 post 6.2e-05 / bi 8.4e-05、argmax 全 0；冒烟 epoch-0 与 Run2 **逐位一致**（max_diff=0.0）、Δ 梯度 @init 非零且 base grad=None、部署 Params/FLOPs 与锚点精确相等；**预算 equality audit C0/M1 ΔParams=ΔFLOPs=0**。
+- 事实修正：本仓库配置 `downsample_version=v3`（k3 s2 p1，非文档假设的 k2）；AWB 折叠与 kernel 尺寸无关，assert 只锁定 192→384+stride2 的冻训边界身份，骨干算子原样保留。
+- Phase 1（进行中，GPU0）：**C0_FTR_Post + M1_BiFTR** × LEVIR（300 epoch，last2，D=160，bilinear）。判据沿用 PASS/WEAK/FAIL 体系；rep 归因 = M1−C0；WHU 仅在 M1 PASS 且 M1−C0≥+0.05pp 后启动；**WEAK/FAIL → 结束结构搜索、进入论文收尾（不再设计 Run10）**。
+- 设计文档：[`docs/temporary/STR-RepNet_Run9_BiFTR_设计与实验方案.md`](docs/temporary/STR-RepNet_Run9_BiFTR_设计与实验方案.md)；`train_scripts/TAR-DCR/Run9/README.md`。
+
 ## 参考文献
 
 调研文献按 [`docs/temporary/过去的想法/STR-RepNet_结构重参数化_2024-2026文献调研与创新空白.md`](docs/temporary/过去的想法/STR-RepNet_结构重参数化_2024-2026文献调研与创新空白.md)
@@ -246,6 +255,7 @@ train_scripts/
   TAR-DCR/Run1/                # TAR-DCR 启动脚本（A0_Plain / A1_TAR / A2_Full）
   TAR-DCR/Run7/                # PBRU 启动脚本（C0/C1/M1 × 4 数据集，D*=158）
   TAR-DCR/Run8/                # MPCR-Fine 启动脚本（C0_MPCR_Same2 / M1_MPCR_Multi2）
+  TAR-DCR/Run9/                # BiFTR 启动脚本（C0_FTR_Post / M1_BiFTR）
 analyse/                       # 分析工具
   extract_metrics_to_excel.py  #   outputs → docs/experiment_metrics.xlsx
   models_to_txt.py             #   models 代码快照 + 指标 → docs/temporary/*.txt
@@ -253,6 +263,8 @@ analyse/                       # 分析工具
   levir_stage_discriminability.py  # Run7 阶段判别力预检（LDA AUROC）
   search_run8_budget.py        #   Run8 预算机器验证（必须 D*=160）
   levir_fine_stage_profile.py  #   Run8 精细阶段表征画像（机制解释）
+  search_biftr_budget.py       #   Run9 预算 equality audit（必须 Δ=0）
+  levir_biftr_profile.py       #   Run9 冻训边界表征画像（机制解释）
 outputs/                       # 训练日志（训练结束后下载到这里）
 docs/                          # 项目文档（temporary / 参考文献）
 ```
