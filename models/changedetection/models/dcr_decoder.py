@@ -7,6 +7,11 @@ fuse wrapper so bn_h sees the NATIVE low resolution. fuse3 unchanged.
 Run8 MPCR-Fine: refine.pw can become MPCRPW1x1 (two zero-init grouped-1x1
 training branches with complementary channel partitions, absorbed into the
 original dense PW at deploy). block1/2/3, refine.dw, fuses stay unchanged.
+
+Run10 PFDR: t1 passes through PFDRDW5 (pre-fusion dilated re-parameterization,
+single deploy DW5) BEFORE fuse1. The PFDR module itself is attached by
+STRRepNet AFTER all other RNG-consuming constructions (Run9-style) so that the
+C0/M1 epoch-0 outputs stay bitwise identical; here we only hold the flags.
 """
 import torch.nn as nn
 import torch.nn.functional as F
@@ -17,6 +22,7 @@ from changedetection.models.reparam import (
     RepPairFuse1x1,
     NSCRPairFuse1x1,
     MPCRPW1x1,
+    PFDRDW5,
     switch_module_to_deploy,
 )
 
@@ -65,7 +71,8 @@ class DCRDecoder(nn.Module):
     """
 
     def __init__(self, dim=160, use_aux=True, use_residual=True, nscr_scope="none",
-                 deploy=False, use_mpcr=False, mpcr_mode="multi2", mpcr_groups=4):
+                 deploy=False, use_mpcr=False, mpcr_mode="multi2", mpcr_groups=4,
+                 use_pfdr=False, pfdr_mode="rep", pfdr_scope="fine1"):
         super().__init__()
         self.dim = dim
         self.use_aux = use_aux
@@ -73,6 +80,13 @@ class DCRDecoder(nn.Module):
         self.use_mpcr = use_mpcr
         self.act = nn.SiLU()
         mode = NSCR_MODES.get(nscr_scope, "none")
+
+        # Run10 PFDR flags; the PFDRDW5 module itself is attached by STRRepNet
+        # AFTER all other RNG-consuming constructions (see STRRepNet).
+        self.use_pfdr = use_pfdr
+        self.pfdr_mode = pfdr_mode
+        self.pfdr_scope = pfdr_scope
+        self.prefuse1 = None
 
         self.fuse3 = RepPairFuse1x1(dim, use_aux=use_aux, use_residual=use_residual, deploy=deploy)
         self.block3 = RepLocalBlock(dim, use_aux=use_aux, use_residual=use_residual, deploy=deploy)
@@ -97,6 +111,12 @@ class DCRDecoder(nn.Module):
 
     def forward(self, feats):
         t1, t2, t3, t4 = feats
+
+        # Run10 PFDR: spatial conditioning of the fine lateral BEFORE cross-scale
+        # semantic mixing (doc §3.1; pfdr_scope="fine1" only, before fuse1).
+        if self.use_pfdr:
+            assert self.prefuse1 is not None, "PFDR module not attached (STRRepNet)"
+            t1 = self.prefuse1(t1)
 
         d4 = t4
 

@@ -620,3 +620,119 @@ class MPCRPW1x1(nn.Module):
             if hasattr(self, name):
                 delattr(self, name)
         return self
+
+
+# -----------------------------------------------------------------------------
+# Run10 PFDR: Pre-Fusion Dilated Re-parameterization (fine lateral, before fuse1)
+# -----------------------------------------------------------------------------
+def embed_3x3_center_5x5(w):
+    """(D,1,3,3) -> (D,1,5,5): E_3(K)[:,:,1:4,1:4] = K."""
+    return F.pad(w, (1, 1, 1, 1))
+
+
+def embed_3x3_d2_5x5(w):
+    """(D,1,3,3) -> (D,1,5,5): E_d2(K)[:,:,{0,2,4},{0,2,4}] = K (dilation-2 sparse)."""
+    out = torch.zeros(w.shape[0], 1, 5, 5, dtype=w.dtype, device=w.device)
+    out[:, :, 0::2, 0::2] = w
+    return out
+
+
+def embed_1x1_center_5x5(w):
+    """(D,1,1,1) -> (D,1,5,5): E_1(K)[:,:,2,2] = K."""
+    out = torch.zeros(w.shape[0], 1, 5, 5, dtype=w.dtype, device=w.device)
+    out[:, :, 2, 2] = w
+    return out
+
+
+class PFDRDW5(nn.Module):
+    """Run10 PFDR: Pre-Fusion Dilated Re-parameterization depthwise 5x5 block.
+
+    Train graph (mode="rep"):
+        Y = BN5(DW5x5(X)) + BN3(DW3x3(X)) + BNd2(DW3x3(d=2)(X)) + BN1(DW1x1(X)) + alpha*X
+    aux convs are zero-init and aux BNs have gamma=beta=0, so the epoch-0 aux
+    output is EXACTLY 0 and M1 starts from the plain main-branch prediction.
+    Deploy graph (both modes): single DW5x5 (groups=D, padding=2, bias=True);
+    all branches are composed in FP64 and cast to FP32 exactly once.
+
+    mode="plain" (C0): only the main DW5+BN (+alpha residual) — deploy graph
+    is IDENTICAL to mode="rep" (M1), so M1-C0 isolates the rep effect.
+
+    NOTE (RNG): nn.Conv2d construction consumes RNG even for immediately-zeroed
+    weights, so this module MUST be attached AFTER all other RNG-consuming
+    constructions (Run9-style) for the C0/M1 epoch-0 bitwise identity to hold.
+    """
+
+    def __init__(self, channels, mode="rep", use_alpha=True, deploy=False):
+        super().__init__()
+        self.channels = channels
+        self.mode = mode if mode in ("plain", "rep") else "rep"
+        self.use_alpha = use_alpha
+        self.deploy = deploy
+        if deploy:
+            self.dw = nn.Conv2d(channels, channels, 5, 1, 2, groups=channels, bias=True)
+        else:
+            self.dw5 = nn.Conv2d(channels, channels, 5, 1, 2, groups=channels, bias=False)
+            self.bn5 = nn.BatchNorm2d(channels)
+            nn.init.kaiming_normal_(self.dw5.weight, mode="fan_out", nonlinearity="relu")
+            if self.mode == "rep":
+                self.dw3 = nn.Conv2d(channels, channels, 3, 1, 1, groups=channels, bias=False)
+                self.bn3 = nn.BatchNorm2d(channels)
+                self.dwd2 = nn.Conv2d(channels, channels, 3, 1, 2, dilation=2, groups=channels, bias=False)
+                self.bnd2 = nn.BatchNorm2d(channels)
+                self.dw1 = nn.Conv2d(channels, channels, 1, 1, 0, groups=channels, bias=False)
+                self.bn1 = nn.BatchNorm2d(channels)
+                for c in (self.dw3, self.dwd2, self.dw1):
+                    nn.init.zeros_(c.weight)
+                for bn in (self.bn3, self.bnd2, self.bn1):
+                    nn.init.zeros_(bn.weight)
+                    nn.init.zeros_(bn.bias)
+            if self.use_alpha:
+                self.alpha = nn.Parameter(torch.ones(1))
+
+    def forward(self, x):
+        if self.deploy:
+            return self.dw(x)
+        y = self.bn5(self.dw5(x))
+        if self.mode == "rep":
+            y = y + self.bn3(self.dw3(x)) + self.bnd2(self.dwd2(x)) + self.bn1(self.dw1(x))
+        if self.use_alpha:
+            y = y + self.alpha * x
+        return y
+
+    def get_equivalent_kernel_bias(self):
+        W5, b5 = fold_conv_bn(self.dw5.weight, None, self.bn5)
+        K = W5
+        b = b5
+        if self.mode == "rep":
+            W3, b3 = fold_conv_bn(self.dw3.weight, None, self.bn3)
+            Wd, bd = fold_conv_bn(self.dwd2.weight, None, self.bnd2)
+            W1, b1 = fold_conv_bn(self.dw1.weight, None, self.bn1)
+            K = K + embed_3x3_center_5x5(W3) + embed_3x3_d2_5x5(Wd) + embed_1x1_center_5x5(W1)
+            b = b + b3 + bd + b1
+        if self.use_alpha:
+            K = K + self.alpha.detach().double() * identity_dw_kernel(
+                self.channels, 5, device=K.device, dtype=torch.float64)
+        return K, b
+
+    def branch_stats(self):
+        s = {"main_gamma": self.bn5.weight.norm().item()}
+        if self.mode == "rep":
+            s["near3_gamma"] = self.bn3.weight.norm().item()
+            s["dilated3_gamma"] = self.bnd2.weight.norm().item()
+            s["center1_gamma"] = self.bn1.weight.norm().item()
+        if self.use_alpha:
+            s["alpha"] = self.alpha.item()
+        return s
+
+    def switch_to_deploy(self):
+        if self.deploy:
+            return self
+        kernel, bias = self.get_equivalent_kernel_bias()
+        self.dw = nn.Conv2d(self.channels, self.channels, 5, 1, 2, groups=self.channels, bias=True)
+        self.dw.weight.data = kernel.float()
+        self.dw.bias.data = bias.float()
+        self.deploy = True
+        for name in ("dw3", "bn3", "dwd2", "bnd2", "dw1", "bn1", "dw5", "bn5", "alpha"):
+            if hasattr(self, name):
+                delattr(self, name)
+        return self

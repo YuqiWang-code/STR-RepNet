@@ -129,6 +129,8 @@ class Trainer(object):
             mpcr_groups=self.args.mpcr_groups,
             use_biftr=bool(self.args.use_biftr),
             biftr_mode=self.args.biftr_mode,
+            use_pfdr=bool(self.args.use_pfdr),
+            pfdr_mode=self.args.pfdr_mode,
             patch_size=v.PATCH_SIZE,
             in_chans=v.IN_CHANS,
             num_classes=config.MODEL.NUM_CLASSES,
@@ -312,6 +314,16 @@ class Trainer(object):
                 self.log(f"[BIFTR-DELTA-NORM] in={st['d_in']:.4e} out={st['d_out']:.4e}")
                 self.log(f"[BIFTR-EFFECTIVE-UPDATE-NORM] {st['eff_update']:.4e}")
                 self.log(f"[BIFTR-CROSS-TERM-RATIO] {st['cross_ratio']:.4e}")
+        # PFDR diagnostics (before folding; not used for checkpoint selection)
+        if self.args.use_pfdr:
+            st = getattr(self.model.decoder, "prefuse1", None)
+            st = getattr(st, "branch_stats", lambda: None)() or {}
+            if "main_gamma" in st:
+                parts = f"main={st['main_gamma']:.4e}"
+                if "near3_gamma" in st:
+                    parts += (f" near3={st['near3_gamma']:.4e} "
+                              f"dilated3={st['dilated3_gamma']:.4e} center1={st['center1_gamma']:.4e}")
+                self.log(f"[PFDR-BRANCH-NORM] {parts}")
 
         ref_pre = torch.randn(1, 3, self.args.crop_size, self.args.crop_size).cuda()
         ref_post = torch.randn(1, 3, self.args.crop_size, self.args.crop_size).cuda()
@@ -352,6 +364,10 @@ class Trainer(object):
         self.log(f"[BIFTR] {int(self.args.use_biftr)}")
         self.log(f"[BIFTR-MODE] {self.args.biftr_mode}")
         self.log(f"[BIFTR-TRANSITION] stage2_to_stage3")
+        self.log(f"[PFDR] {int(self.args.use_pfdr)}")
+        self.log(f"[PFDR-MODE] {self.args.pfdr_mode}")
+        self.log("[PFDR-SCOPE] fine1_prefuse")
+        self.log("[PFDR-DEPLOY-KERNEL] 5")
         self.log(f"[ENCODER-TRAIN] {self.args.encoder_train}")
         self.log(f"[TEMPORAL-SWAP-PROB] {self.args.temporal_swap_prob}")
         self.log(f"[TOTAL-TRAIN-GRAPH-PARAMS] {fmt_params(train_total)} M")
@@ -414,6 +430,8 @@ def main():
     parser.add_argument('--mpcr_groups', type=int, default=4)
     parser.add_argument('--use_biftr', type=int, default=0)
     parser.add_argument('--biftr_mode', type=str, default='bi', choices=['post', 'bi'])
+    parser.add_argument('--use_pfdr', type=int, default=0)
+    parser.add_argument('--pfdr_mode', type=str, default='rep', choices=['plain', 'rep'])
     parser.add_argument('--num_workers', type=int, default=8)
     parser.add_argument('--seed', type=int, default=2333)
     parser.add_argument('--resume', type=str, default=None)
@@ -443,6 +461,13 @@ def main():
             parser.error("--use_biftr requires --head_mode bilinear and --decoder_dim 160 (Run9)")
         if args.use_pbru or args.use_mpcr or args.use_nscr or args.use_botr:
             parser.error("--use_biftr cannot combine with pbru/mpcr/nscr/botr (Run9 attribution)")
+    # Run10 config guards: PFDR only on the Run2 anchor config modulo D* (last2,
+    # bilinear, rep_mode full, no other mechanism).
+    if args.use_pfdr:
+        if args.head_mode != "bilinear" or args.encoder_train != "last2" or args.rep_mode != "full":
+            parser.error("--use_pfdr requires head_mode bilinear + encoder_train last2 + rep_mode full (Run10)")
+        if args.use_pbru or args.use_mpcr or args.use_nscr or args.use_botr or args.use_biftr:
+            parser.error("--use_pfdr cannot combine with pbru/mpcr/nscr/botr/biftr (Run10 attribution)")
 
     if args.gpu >= 0:
         torch.cuda.set_device(args.gpu)

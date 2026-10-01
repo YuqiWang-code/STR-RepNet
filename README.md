@@ -42,6 +42,7 @@ Lightweight Spatial-Temporal Structural Re-parameterization Network for Remote S
 - **PBRU**（Run7 迭代，已按判据 WEAK 归档）：Phase-Basis Reparameterized Upsampling 输出头——部署为单个 `Conv2d(D→C·r²,1)` + `PixelShuffle(r)`（全分辨率、无插值）；训练期叠加 4 个零初始化相位基分支 `{1,u,v,u·v}`（BN γ=β=0），FP64 解析折叠吸收（`--head_mode pixelshuffle --use_pbru 1`，部署 +0 参数/FLOPs vs 纯 PixelShuffle，经 D\*=158 预算搜索与 Run2 部署预算持平）
 - **MPCR-Fine**（Run8 迭代，已按判据 FAIL 停止）：Fine-stage Multi-Partition Channel Reparameterization——`refine.pw` 加两个同参数量零初始化 grouped 1×1 分支（groups=4，连续/交织互补分区），`W_eq = W_core + Σ P⁻¹W̃P` 解析折叠回原 dense PW（`--use_mpcr`，部署 +0 参数/FLOPs，预算机器验证 D\*=160、Δ=0）
 - **BiFTR**（Run9 迭代，最后一次结构搜索，已按判据 FAIL 结束）：Bi-sided Frozen-to-Trainable Transition Reparameterization——包装 `encoder.layers[1].downsample` 的 192→384 stride-2 Conv（frozen stage2→trainable stage3 边界），训练期 `y=(I+Δout)W((I+Δin)x)`（Δ 零初始化 1×1，base 冻结），部署 `W_eq=AWB、b_eq=Ab` 折叠回原单个 Conv（`--use_biftr`，部署 +0 参数/FLOPs，预算 equality audit Δ=0）
+- **PFDR**（Run10 迭代，进行中）：Pre-Fusion Dilated Re-parameterization——`t1` 在 `fuse1` 前过可部署 DW5×5，训练期叠加 `DW3 + DW3(d=2) + DW1` 零初始化 depthwise basis，部署解析折叠为单个 DW5（`--use_pfdr 1 --pfdr_mode plain|rep`；预算经 D\* 宽度搜索回收，预注册 gate D\*≥158）
 
 - 模型入口：`models/changedetection/models/STRRepNet.py`（`STRRepNet`）
 - 核心文件：`reparam.py`（代数折叠原语）、`tar.py`（二时相 bridge）、`dcr_decoder.py`（多尺度解码器）
@@ -236,6 +237,27 @@ Run2 在 Run1 基础上做了两处改造（部署图/参数/FLOPs 完全不变�
   证据（正文保留最有信息量的负结果）、方法冻结后补 3-seed × 4 数据集正式稳定性。
 - 设计文档：[`docs/temporary/STR-RepNet_Run9_BiFTR_设计与实验方案.md`](docs/temporary/STR-RepNet_Run9_BiFTR_设计与实验方案.md)；`train_scripts/TAR-DCR/Run9/README.md`。
 
+## 实验结果（Run10：PFDR，进行中）
+
+- **背景**：目标改为四数据集硬门槛（CDD ≥98 / LEVIR ≥92.5 / WHU ≥95 / SYSU ≥85）；
+  LEVIR 差 +1.06、SYSU 差 +1.55 → 按新目标**重开结构搜索**，但只允许与 Run3–Run9
+  「参数化函数类」真正不同的方向。
+- **主方案 PFDR**（Pre-Fusion Dilated Re-parameterization）：最细尺度 `t1` 在 `fuse1`
+  跨尺度混合**之前**过可部署 DW5×5；训练期 `DW5+DW3+DW3(d=2)+DW1+α·I` 多尺度 depthwise
+  basis（aux 零初始化），部署解析折叠为单个 DW5（FP64、一次 FP32 cast）。针对 Run6 的
+  small-object FN（24% 完全漏检）——「先保真/扩域空间细节，再混合语义」，与前三类失败
+  参数化家族（channel basis / phase basis / serial multiplicative）正交。
+- **消融**：A0 = Run2 full_last2（不重跑）；C0 = plain pre-fusion DW5（deploy 拓扑对照）；
+  M1 = 多分支训练 / 单 DW5 部署。**C0 与 M1 deploy graph 完全相同**，归因
+  Topology=C0−A0、Rep=M1−C0、System=M1−A0。
+- **预算**：DW5 约 +4.2K 参数，用解码器宽度 D\* 搜索回收（`analyse/search_run10_pfdr_budget.py`，
+  D=160↓152；预注册 gate：D\*≥158 才训练）。
+- **判据（LEVIR）**：PASS = M1 F1≥0.9200 & IoU≥0.8520 & Precision≥0.9230 & M1−C0≥+0.15pp
+  & 预算/argmax 合格；TARGET-HIT = F1≥0.9250（项目硬目标）；FAIL = F1<0.9159 或
+  Precision<0.9220 或 M1−C0<+0.05pp 或硬门槛失败。WEAK/FAIL 不 sweep。PASS 才扩
+  SYSU→WHU→CDD。
+- 设计文档：[`docs/temporary/STR-RepNet_Run10_PFDR_设计与实验方案.md`](docs/temporary/STR-RepNet_Run10_PFDR_设计与实验方案.md)；`train_scripts/TAR-DCR/Run10/README.md`。
+
 ## 参考文献
 
 调研文献按 [`docs/temporary/过去的想法/STR-RepNet_结构重参数化_2024-2026文献调研与创新空白.md`](docs/temporary/过去的想法/STR-RepNet_结构重参数化_2024-2026文献调研与创新空白.md)
@@ -270,6 +292,7 @@ train_scripts/
   TAR-DCR/Run7/                # PBRU 启动脚本（C0/C1/M1 × 4 数据集，D*=158）
   TAR-DCR/Run8/                # MPCR-Fine 启动脚本（C0_MPCR_Same2 / M1_MPCR_Multi2）
   TAR-DCR/Run9/                # BiFTR 启动脚本（C0_FTR_Post / M1_BiFTR）
+  TAR-DCR/Run10/               # PFDR 启动脚本（C0_PlainPF_DW5 / M1_PFDR_DW5，D=D*）
 analyse/                       # 分析工具
   extract_metrics_to_excel.py  #   outputs → docs/experiment_metrics.xlsx
   models_to_txt.py             #   models 代码快照 + 指标 → docs/temporary/*.txt
@@ -279,6 +302,8 @@ analyse/                       # 分析工具
   levir_fine_stage_profile.py  #   Run8 精细阶段表征画像（机制解释）
   search_biftr_budget.py       #   Run9 预算 equality audit（必须 Δ=0）
   levir_biftr_profile.py       #   Run9 冻训边界表征画像（机制解释）
+  search_run10_pfdr_budget.py  #   Run10 预算搜索（必须 D*≥158，C0==M1）
+  levir_prefusion_retention_profile.py  # Run10 Phase -1 融合前保留度诊断（t1→fuse1→block1→refine）
 outputs/                       # 训练日志（训练结束后下载到这里）
 docs/                          # 项目文档（temporary / 参考文献）
 ```

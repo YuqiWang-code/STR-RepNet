@@ -8,6 +8,11 @@ deploy params/FLOPs identical to use_pbru=0).
 Run8 additions: --use_mpcr checks (MPCR only on refine.pw, BN zero-init,
 epoch-0 output EXACTLY equal to use_mpcr=0, group-conv/gamma gradients non-zero,
 deploy branch deletion, deploy Params/FLOPs EXACTLY equal to the anchor).
+Run10 additions: --use_pfdr checks (PFDRDW5 only on decoder t1 before fuse1,
+aux conv/BN zero-init, C0/M1 main-branch init identical + epoch-0 logits
+bitwise equal, aux BN gamma grads non-zero + aux conv grads after gamma nudge,
+deploy = single DW5, C0/M1 deploy Params/FLOPs identical, optional anchor
+budget check at D* via --check_anchor).
 """
 import copy
 import os
@@ -37,6 +42,7 @@ def build_model(args, config):
         use_pbru=bool(args.use_pbru), pbru_upscale=args.pbru_upscale,
         use_mpcr=bool(args.use_mpcr), mpcr_mode=args.mpcr_mode, mpcr_groups=args.mpcr_groups,
         use_biftr=bool(args.use_biftr), biftr_mode=args.biftr_mode,
+        use_pfdr=bool(args.use_pfdr), pfdr_mode=args.pfdr_mode,
         patch_size=v.PATCH_SIZE, in_chans=v.IN_CHANS, num_classes=config.MODEL.NUM_CLASSES,
         depths=v.DEPTHS, dims=v.EMBED_DIM,
         ssm_d_state=v.SSM_D_STATE, ssm_ratio=v.SSM_RATIO, ssm_rank_ratio=v.SSM_RANK_RATIO,
@@ -72,6 +78,9 @@ def main():
     ap.add_argument('--mpcr_groups', type=int, default=4)
     ap.add_argument('--use_biftr', type=int, default=0)
     ap.add_argument('--biftr_mode', type=str, default='bi', choices=['post', 'bi'])
+    ap.add_argument('--use_pfdr', type=int, default=0)
+    ap.add_argument('--pfdr_mode', type=str, default='rep', choices=['plain', 'rep'])
+    ap.add_argument('--check_anchor', type=int, default=0)
     ap.add_argument('--gpu', type=int, default=0)
     args = ap.parse_args()
 
@@ -139,6 +148,21 @@ def main():
         if hasattr(b, "d_in"):
             assert b.d_in.weight.abs().sum().item() == 0.0
         print("  BiFTR OK (192->384 stride-2 wrapped; base frozen; deltas trainable + zero-init)")
+
+    if args.use_pfdr:
+        print("[1b/6] PFDR structure ...")
+        p = model.decoder.prefuse1
+        assert p is not None and p.__class__.__name__ == "PFDRDW5", "decoder.prefuse1 must be PFDRDW5"
+        assert p.mode == args.pfdr_mode, f"prefuse1 mode {p.mode} != {args.pfdr_mode}"
+        assert model.decoder.pfdr_scope == "fine1"
+        assert model.decoder.use_pfdr is True
+        if args.pfdr_mode == "rep":
+            for name in ("dw3", "dwd2", "dw1"):
+                assert getattr(p, name).weight.abs().sum().item() == 0.0, f"{name} must be zero-init"
+            for name in ("bn3", "bnd2", "bn1"):
+                b = getattr(p, name)
+                assert b.weight.abs().sum().item() == 0.0 and b.bias.abs().sum().item() == 0.0
+        print("  PFDR zero-init OK (aux conv weights=0, aux BN gamma=beta=0)")
 
     # encoder train mode per encoder_train
     enc_trainable = sum(p.numel() for p in model.encoder.parameters() if p.requires_grad)
@@ -284,6 +308,59 @@ def main():
             assert g is not None and g.abs().sum().item() > 0, "d_in grad must be non-zero"
         print("  BiFTR grads OK (deltas non-zero @init, base conv grad=None)")
 
+    if args.use_pfdr:
+        print("[2i/6] PFDR C0/M1 epoch-0 identity + shared-init identity ...")
+        torch.manual_seed(2333)
+        m_rep = build_model(args, config).cuda()
+        torch.manual_seed(2333)
+        args_plain = argparse.Namespace(**{**vars(args), "pfdr_mode": "plain"})
+        m_plain = build_model(args_plain, config).cuda()
+        # main branch init identical
+        for n in ("dw5.weight", "bn5.weight", "bn5.bias", "alpha"):
+            a = getattr(m_rep.decoder.prefuse1, n).detach()
+            b = getattr(m_plain.decoder.prefuse1, n).detach()
+            assert torch.equal(a, b), f"PFDR main-branch init differs: {n}"
+        # every non-PFDR shared weight identical (encoder/tar/decoder/head)
+        sd_rep = m_rep.state_dict()
+        sd_pl = m_plain.state_dict()
+        for k in sd_rep:
+            if "prefuse1" in k:
+                continue
+            assert torch.equal(sd_rep[k], sd_pl[k]), f"shared weight differs: {k}"
+        m_rep.eval()
+        m_plain.eval()
+        with torch.no_grad():
+            o_rep = m_rep(pre, post)
+            o_pl = m_plain(pre, post)
+        d = (o_rep - o_pl).abs().max().item()
+        assert d == 0.0, f"PFDR M1 epoch-0 output must equal C0 EXACTLY, got {d}"
+        print(f"  PFDR C0/M1 main-init identical + epoch-0 logits bitwise equal (max_diff={d})")
+
+        if args.pfdr_mode == "rep":
+            print("[2j/6] PFDR gradient flow ...")
+            m_grad = copy.deepcopy(model)
+            m_grad.train()
+            out_g = m_grad(pre, post)
+            loss = torch.nn.functional.cross_entropy(out_g, torch.randint(0, 2, (2, 256, 256)).cuda())
+            loss.backward()
+            p = m_grad.decoder.prefuse1
+            for name in ("bn3", "bnd2", "bn1"):
+                g = getattr(p, name).weight.grad
+                assert g is not None and g.abs().sum().item() > 0, f"{name} gamma grad must be non-zero"
+            # zero-init branch dynamics: gamma=0 blocks aux conv grads at step 0;
+            # they must appear after a gamma nudge (Run8-style check).
+            with torch.no_grad():
+                for name in ("bn3", "bnd2", "bn1"):
+                    getattr(p, name).weight.add_(0.01)
+            m_grad.zero_grad()
+            out_g2 = m_grad(pre, post)
+            loss2 = torch.nn.functional.cross_entropy(out_g2, torch.randint(0, 2, (2, 256, 256)).cuda())
+            loss2.backward()
+            for name in ("dw3", "dwd2", "dw1"):
+                g = getattr(p, name).weight.grad
+                assert g is not None and g.abs().sum().item() > 0, f"{name} weight grad must appear after gamma nudge"
+            print("  PFDR gamma grads non-zero @init + aux conv grads non-zero after gamma nudge: OK")
+
     print("[3/6] deploy fold ...")
     deploy = copy.deepcopy(model)
     deploy.switch_to_deploy()
@@ -299,6 +376,14 @@ def main():
     assert not has_mpcr, "deploy graph must not contain g0/g1/bn0/bn1/core"
     has_biftr = any(("d_in" in k or "d_out" in k) for k in sd_keys)
     assert not has_biftr, "deploy graph must not contain d_in/d_out"
+    has_pfdr = any(("dw3" in k or "dwd2" in k or "dw1" in k or "bn3" in k or "bnd2" in k
+                    or "bn1" in k or "dw5" in k or "bn5" in k) for k in sd_keys)
+    assert not has_pfdr, "deploy graph must not contain PFDR train branches"
+    if args.use_pfdr:
+        keys = sorted(k for k in sd_keys if "prefuse1" in k)
+        assert keys == ["decoder.prefuse1.dw.bias", "decoder.prefuse1.dw.weight"], \
+            f"deploy prefuse1 must be exactly one DW5, got {keys}"
+        assert deploy.decoder.prefuse1.deploy, "PFDR module must be in deploy mode"
     if args.use_biftr:
         # deploy graph must be exactly one downsample Conv (wrapper folded)
         assert deploy.biftr.deploy, "BiFTR wrapper must be in deploy mode"
@@ -404,6 +489,47 @@ def main():
         print(f"  deploy FLOPs biftr={f_n:.4f} vs anchor={f_0:.4f} (batch2)")
         assert f_n == f_0, "deploy FLOPs must be EXACTLY the Run2 anchor"
         print(f"  deploy Params/FLOPs EXACTLY equal to the Run2 anchor: OK ({deploy_params/1e6:.3f} M)")
+    elif args.use_pfdr:
+        # C0/M1 deploy Params/FLOPs must be IDENTICAL (same single DW5 topology)
+        args_p0 = argparse.Namespace(**{**vars(args), "pfdr_mode": "plain"})
+        model0 = build_model(args_p0, config).cuda()
+        deploy0 = copy.deepcopy(model0)
+        deploy0.switch_to_deploy()
+        deploy0.eval()
+        p0 = sum(p.numel() for p in deploy0.parameters())
+        assert p0 == deploy_params, f"deploy params differ: rep={deploy_params} vs plain={p0}"
+        from fvcore.nn import flop_count
+        from classification.models.vmamba import selective_scan_flop_jit
+        supported = {
+            "prim::PythonOp.SelectiveScanMamba": selective_scan_flop_jit,
+            "prim::PythonOp.SelectiveScanOflex": selective_scan_flop_jit,
+            "prim::PythonOp.SelectiveScanCore": selective_scan_flop_jit,
+        }
+        with torch.no_grad():
+            c_n, _ = flop_count(deploy, (pre, post), supported_ops=supported)
+            c_0, _ = flop_count(deploy0, (pre, post), supported_ops=supported)
+        f_n, f_0 = sum(c_n.values()), sum(c_0.values())
+        print(f"  deploy FLOPs rep={f_n:.4f} vs plain={f_0:.4f} (batch2)")
+        assert f_n == f_0, "deploy FLOPs must be identical between PFDR rep/plain"
+        print(f"  C0/M1 deploy Params/FLOPs identical: OK ({deploy_params/1e6:.3f} M)")
+        if args.check_anchor:
+            # deploy budget vs the Run2 anchor (use_pfdr=0, D=160): must be <=.
+            # Only run at D=D* (the budget script finds D*; at D=160 PFDR adds
+            # the DW5 cost and legitimately exceeds the anchor).
+            args_a = argparse.Namespace(**{**vars(args), "use_pfdr": 0, "decoder_dim": 160,
+                                           "pfdr_mode": "plain"})
+            model_a = build_model(args_a, config).cuda()
+            deploy_a = copy.deepcopy(model_a)
+            deploy_a.switch_to_deploy()
+            deploy_a.eval()
+            pa = sum(p.numel() for p in deploy_a.parameters())
+            with torch.no_grad():
+                c_a, _ = flop_count(deploy_a, (pre, post), supported_ops=supported)
+            f_a = sum(c_a.values())
+            assert deploy_params <= pa, f"deploy params exceed anchor: {deploy_params} > {pa}"
+            assert f_n <= f_a, f"deploy FLOPs exceed anchor: {f_n} > {f_a}"
+            print(f"  deploy <= Run2 anchor (D=160): params {deploy_params/1e6:.3f} <= {pa/1e6:.3f} M, "
+                  f"FLOPs {f_n:.4f} <= {f_a:.4f} G: OK")
     else:
         print(f"  deploy params = {deploy_params/1e6:.3f} M")
 

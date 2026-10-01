@@ -35,6 +35,16 @@ Run9 additions (BiFTR):
     (std 0.05) + FP64 algebra (1e-9, same reason);
   - T2: whole-model fold with use_biftr (post/bi, encoder_train=last2),
     tol=2e-4, argmax=0, freeze-state asserts (base frozen, deltas trainable).
+
+Run10 additions (PFDR):
+  - T0: FP64 multi-branch (DW5 + DW3 + DW3(d=2) + DW1 + alpha*I) == single
+    K_eq DW5 algebra. Fixed requirement max_abs_error < 1e-10 (target <1e-12;
+    pure FP64 accumulation floor at D=32). Embedding unit tests (3x3 center,
+    dilation-2 sparse, 1x1 center, identity center) must be exact;
+  - T1: PFDRDW5 (plain + rep) fold, FP32 tol=2e-5, non-trivial branch weights
+    (conv std 0.05, BN gamma std 0.5) + FP64 algebra <1e-10;
+  - T2: whole-model fold with use_pfdr (plain/rep, encoder_train=last2),
+    tol=2e-4, argmax=0.
 """
 import argparse
 import copy
@@ -52,7 +62,10 @@ if _MODELS_ROOT not in sys.path:
 from changedetection.models.reparam import (RepDW3, RepPW1x1, RepPairFuse1x1, NSCRPairFuse1x1,
                                             PBRUHead, build_phase_basis, fold_conv_bn,
                                             MPCRPW1x1, make_interleaved_permutation,
-                                            invert_permutation, group1x1_to_dense_fp64)
+                                            invert_permutation, group1x1_to_dense_fp64,
+                                            PFDRDW5, embed_3x3_center_5x5,
+                                            embed_3x3_d2_5x5, embed_1x1_center_5x5,
+                                            identity_dw_kernel)
 from changedetection.models.Mamba_backbone import BiFTRTransition
 from changedetection.models.tar import TemporalRep1x1, TARStage, MultiScaleTAR
 from changedetection.models.dcr_decoder import RepLocalBlock, DCRDecoder
@@ -355,6 +368,112 @@ def biftr_block_tests(device):
     return ok
 
 
+def test_pfdr_embedding_algebra():
+    """T0 (Run10): FP64 PFDR multi-branch == single K_eq DW5 algebra.
+
+    Fixed requirement: max_abs_error < 1e-10 (target <1e-12). D=32 with O(1)
+    magnitudes; measured error is the pure-FP64 accumulation floor.
+    """
+    torch.manual_seed(0)
+    D = 32
+    x = torch.randn(2, D, 16, 16, dtype=torch.float64)
+    K5 = torch.randn(D, 1, 5, 5, dtype=torch.float64)
+    K3 = torch.randn(D, 1, 3, 3, dtype=torch.float64)
+    Kd = torch.randn(D, 1, 3, 3, dtype=torch.float64)
+    K1 = torch.randn(D, 1, 1, 1, dtype=torch.float64)
+    b5 = torch.randn(D, dtype=torch.float64)
+    b3 = torch.randn(D, dtype=torch.float64)
+    bd = torch.randn(D, dtype=torch.float64)
+    b1 = torch.randn(D, dtype=torch.float64)
+    alpha = torch.randn(1, dtype=torch.float64)
+
+    # embedding unit tests (must be exact)
+    e3 = embed_3x3_center_5x5(K3)
+    assert torch.equal(e3[:, :, 1:4, 1:4], K3) and e3.abs().sum() == K3.abs().sum()
+    e_d = embed_3x3_d2_5x5(Kd)
+    assert torch.equal(e_d[:, :, 0::2, 0::2], Kd) and e_d.abs().sum() == Kd.abs().sum()
+    e1 = embed_1x1_center_5x5(K1)
+    assert torch.equal(e1[:, :, 2, 2], K1[:, :, 0, 0]) and e1.abs().sum() == K1.abs().sum()
+    ident = identity_dw_kernel(D, 5, dtype=torch.float64)
+    assert torch.equal(ident[:, 0, 2, 2], torch.ones(D, dtype=torch.float64)) \
+        and ident.abs().sum() == D
+    print("[OK] PFDR embeddings exact (3x3 center / dilation-2 sparse / 1x1 center / identity)")
+
+    y_direct = (F.conv2d(x, K5, b5, padding=2, groups=D)
+                + F.conv2d(x, K3, b3, padding=1, groups=D)
+                + F.conv2d(x, Kd, bd, padding=2, dilation=2, groups=D)
+                + F.conv2d(x, K1, b1, groups=D)
+                + alpha * x)
+    K_eq = (K5 + e3 + e_d + e1
+            + alpha * identity_dw_kernel(D, 5, dtype=torch.float64))
+    b_eq = b5 + b3 + bd + b1
+    y_fold = F.conv2d(x, K_eq, b_eq, padding=2, groups=D)
+    err = (y_direct - y_fold).abs().max().item()
+    ok = err < 1e-10
+    print(f"[{'OK' if ok else 'FAIL'}] PFDR multi-branch == single DW5 (FP64): {err:.3e}")
+    return ok
+
+
+def pfdr_block_tests(device):
+    """T1 (Run10): PFDRDW5 train->deploy fold (FP32 tol=2e-5) + FP64 algebra.
+
+    Aux branches are zero-init by design -> perturb to TRAINED magnitudes
+    (conv std 0.05, BN gamma/beta std 0.5, running stats randomized) so the
+    fold is non-trivial. FP64 equivalent-kernel algebra tol 1e-10.
+    """
+    torch.manual_seed(2333)
+    x = torch.randn(2, 64, 32, 32, device=device)
+    ok = True
+    for mode in ("plain", "rep"):
+        h = PFDRDW5(64, mode=mode).to(device)
+        with torch.no_grad():
+            h.dw5.weight.normal_(0.0, 0.05)
+            h.bn5.weight.normal_(0.0, 0.5)
+            h.bn5.bias.normal_(0.0, 0.5)
+            h.bn5.running_mean.normal_()
+            h.bn5.running_var.uniform_(0.5, 2.0)
+            if mode == "rep":
+                for c in (h.dw3, h.dwd2, h.dw1):
+                    c.weight.normal_(0.0, 0.05)
+                for bn in (h.bn3, h.bnd2, h.bn1):
+                    bn.weight.normal_(0.0, 0.5)
+                    bn.bias.normal_(0.0, 0.5)
+                    bn.running_mean.normal_()
+                    bn.running_var.uniform_(0.5, 2.0)
+        h.eval()
+        with torch.no_grad():
+            y0 = h(x)
+        h2 = copy.deepcopy(h)
+        h2.switch_to_deploy()
+        h2.eval()
+        with torch.no_grad():
+            y1 = h2(x)
+        err = (y0 - y1).abs().max().item()
+        ok &= err < 2e-5
+        keys = list(h2.state_dict().keys())
+        assert keys == ["dw.weight", "dw.bias"], f"deploy PFDRDW5 must be a single DW5, got {keys}"
+        print(f"[{'OK' if err < 2e-5 else 'FAIL'}] PFDRDW5({mode}) fold: max_abs_error={err:.3e}")
+
+        W, b = h.get_equivalent_kernel_bias()
+        assert W.dtype == torch.float64 and b.dtype == torch.float64
+        with torch.no_grad():
+            z = F.conv2d(x.double(), W, b, padding=2, groups=64)
+            W5, b5 = fold_conv_bn(h.dw5.weight, None, h.bn5)
+            z2 = F.conv2d(x.double(), W5, b5, padding=2, groups=64)
+            if mode == "rep":
+                W3, b3 = fold_conv_bn(h.dw3.weight, None, h.bn3)
+                Wd, bd = fold_conv_bn(h.dwd2.weight, None, h.bnd2)
+                W1, b1 = fold_conv_bn(h.dw1.weight, None, h.bn1)
+                z2 = z2 + F.conv2d(x.double(), W3, b3, padding=1, groups=64) \
+                    + F.conv2d(x.double(), Wd, bd, padding=2, dilation=2, groups=64) \
+                    + F.conv2d(x.double(), W1, b1, groups=64)
+            z2 = z2 + h.alpha.detach().double() * x.double()
+        err64 = (z - z2).abs().max().item()
+        ok &= err64 < 1e-10
+        print(f"[{'OK' if err64 < 1e-10 else 'FAIL'}] PFDRDW5({mode}) fold algebra (FP64): {err64:.3e}")
+    return ok
+
+
 def block_tests(device):
     torch.manual_seed(2333)
     C = 160
@@ -394,7 +513,8 @@ def block_tests(device):
 def whole_model_test(device, cfg, pretrained, rep_mode="full", use_botr=False,
                      use_nscr=False, nscr_scope="high2", head_mode="bilinear",
                      use_pbru=False, pbru_upscale=4, use_mpcr=False, mpcr_mode="multi2",
-                     encoder_train="frozen", use_biftr=False, biftr_mode="bi"):
+                     encoder_train="frozen", use_biftr=False, biftr_mode="bi",
+                     use_pfdr=False, pfdr_mode="rep"):
     from changedetection.configs.config import get_config
     from changedetection.models.STRRepNet import STRRepNet
 
@@ -412,6 +532,7 @@ def whole_model_test(device, cfg, pretrained, rep_mode="full", use_botr=False,
         use_pbru=use_pbru, pbru_upscale=pbru_upscale,
         use_mpcr=use_mpcr, mpcr_mode=mpcr_mode, mpcr_groups=4,
         encoder_train=encoder_train, use_biftr=use_biftr, biftr_mode=biftr_mode,
+        use_pfdr=use_pfdr, pfdr_mode=pfdr_mode,
         patch_size=v.PATCH_SIZE, in_chans=v.IN_CHANS, num_classes=config.MODEL.NUM_CLASSES,
         depths=v.DEPTHS, dims=v.EMBED_DIM,
         ssm_d_state=v.SSM_D_STATE, ssm_ratio=v.SSM_RATIO, ssm_rank_ratio=v.SSM_RANK_RATIO,
@@ -466,6 +587,23 @@ def whole_model_test(device, cfg, pretrained, rep_mode="full", use_botr=False,
             model.biftr.d_out.weight.normal_(0.0, 0.05)
             if hasattr(model.biftr, "d_in"):
                 model.biftr.d_in.weight.normal_(0.0, 0.05)
+    # PFDR aux branches are zero-init by design; perturb so the fold is non-trivial.
+    if use_pfdr:
+        with torch.no_grad():
+            p = model.decoder.prefuse1
+            p.dw5.weight.normal_(0.0, 0.05)
+            p.bn5.weight.normal_(0.0, 0.5)
+            p.bn5.bias.normal_(0.0, 0.5)
+            p.bn5.running_mean.normal_()
+            p.bn5.running_var.uniform_(0.5, 2.0)
+            if p.mode == "rep":
+                for c in (p.dw3, p.dwd2, p.dw1):
+                    c.weight.normal_(0.0, 0.05)
+                for bn in (p.bn3, p.bnd2, p.bn1):
+                    bn.weight.normal_(0.0, 0.5)
+                    bn.bias.normal_(0.0, 0.5)
+                    bn.running_mean.normal_()
+                    bn.running_var.uniform_(0.5, 2.0)
 
     model.eval()
     torch.manual_seed(2333)  # deterministic inputs for reproducible argmax check
@@ -485,7 +623,8 @@ def whole_model_test(device, cfg, pretrained, rep_mode="full", use_botr=False,
     ok = err < 2e-4
     print(f"[{'OK' if ok else 'FAIL'}] STRRepNet whole model ({rep_mode}, botr={use_botr}, "
           f"nscr={use_nscr}/{nscr_scope}, head={head_mode}, pbru={use_pbru}, "
-          f"mpcr={use_mpcr}/{mpcr_mode}, biftr={use_biftr}/{biftr_mode}, enc={encoder_train}): "
+          f"mpcr={use_mpcr}/{mpcr_mode}, biftr={use_biftr}/{biftr_mode}, "
+          f"pfdr={use_pfdr}/{pfdr_mode}, enc={encoder_train}): "
           f"max_abs_error={err:.3e}, argmax_disagree={disagree:.3e}")
     return ok
 
@@ -517,11 +656,15 @@ def main():
     print("=== BiFTR AWB algebra (T0, exact) ===")
     t0b_ok = test_biftr_algebra()
 
+    print("=== PFDR embedding + multi-branch algebra (T0, exact) ===")
+    t0p_ok = test_pfdr_embedding_algebra()
+
     print("=== block-level fold tests (tol=2e-5; FP64-composed kernels) ===")
     b_ok = block_tests(device)
     p_ok = pbru_head_tests(device)
     pm_ok = mpcr_block_tests(device)
     pb_ok = biftr_block_tests(device)
+    pp_ok = pfdr_block_tests(device)
 
     print("=== whole-model fold tests (error recorded; FP32 graphs, tol=2e-4) ===")
     w_ok = whole_model_test(device, args.cfg, args.pretrained_weight_path, args.rep_mode)
@@ -540,10 +683,14 @@ def main():
                               encoder_train="last2", use_biftr=True, biftr_mode="post")
     wbb_ok = whole_model_test(device, args.cfg, args.pretrained_weight_path, args.rep_mode,
                               encoder_train="last2", use_biftr=True, biftr_mode="bi")
+    wppl_ok = whole_model_test(device, args.cfg, args.pretrained_weight_path, args.rep_mode,
+                               encoder_train="last2", use_pfdr=True, pfdr_mode="plain")
+    wprp_ok = whole_model_test(device, args.cfg, args.pretrained_weight_path, args.rep_mode,
+                               encoder_train="last2", use_pfdr=True, pfdr_mode="rep")
 
-    all_ok = (c_ok and t0_ok and t0m_ok and t0b_ok and b_ok and p_ok and pm_ok and pb_ok
-              and w_ok and wb_ok and wn_ok and wp_ok and wq_ok and wms_ok and wmm_ok
-              and wbp_ok and wbb_ok)
+    all_ok = (c_ok and t0_ok and t0m_ok and t0b_ok and t0p_ok and b_ok and p_ok and pm_ok
+              and pb_ok and pp_ok and w_ok and wb_ok and wn_ok and wp_ok and wq_ok and wms_ok
+              and wmm_ok and wbp_ok and wbb_ok and wppl_ok and wprp_ok)
     print(f"\n{'ALL PASSED' if all_ok else 'SOME FAILED'}")
     sys.exit(0 if all_ok else 1)
 
