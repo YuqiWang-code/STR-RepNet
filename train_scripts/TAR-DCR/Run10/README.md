@@ -1,7 +1,7 @@
 # Run10 PFDR（Pre-Fusion Dilated Re-parameterization）
 
 > 设计文档：[`docs/temporary/STR-RepNet_Run10_PFDR_设计与实验方案.md`](../../../docs/temporary/STR-RepNet_Run10_PFDR_设计与实验方案.md)
-> 状态：**进行中**（预训练门槛阶段）
+> 状态：**已完成 —— M1 FAIL，PFDR 停止（doc §8）**
 
 ## 方案一句话
 
@@ -54,9 +54,20 @@ PFDR 写成结构重参数化创新。
 - WEAK/FAIL 一律**不做** branch/dilation/scope/kernel sweep（doc §8）。
 - 扩展顺序：PASS → SYSU C0/M1 → WHU C0/M1 → CDD C0/M1（doc §6.5）。
 
-## 结果
+## 结果（LEVIR，300 epoch，seed 2333）
 
-（训练结束后由 watcher 生成 `outputs/TAR-DCR/Run10/_SUMMARY.md`，此处补最终表与裁决。）
+| exp | F1 | Recall | Precision | IoU | deployP(M) | deployF(G) | argmax | dF1 vs A0 |
+|---|---|---|---|---|---|---|---|---|
+| C0_PlainPF_DW5 | 0.9143 | 0.9081 | 0.9206 | 0.8422 | 28.8180 | 12.6028 | 0 | −0.0001 |
+| M1_PFDR_DW5 | 0.9144 | 0.9011 | 0.9280 | 0.8422 | 28.8180 | 12.6028 | 0 | ±0.0000 |
+
+- 归因：Topology(C0−A0) = −0.0001；Rep(M1−C0) = +0.0001（rep-not-supported）；System = ±0.0000。
+- rep 签名：dRecall −0.70pp / dPrecision +0.74pp ——「置信度锐化」第四次出现。
+- PFDR 分支学到非零结构（γ norm：main 12.08 / near3 0.46 / dilated3 0.51 / center1 0.41）。
+- **裁决：M1 FAIL**（F1 0.9144 < 0.9159；M1−C0 < +0.05pp）→ 停止 PFDR，不 sweep，
+  不扩展 SYSU/WHU/CDD（doc §8）。硬条件全程合格（预算内、argmax=0）。
+- 下一步（doc §8-G）：停止 structural branch 搜索，重新审查 deploy architecture
+  function class / dataset protocol / baseline choice。
 
 ## 目录
 

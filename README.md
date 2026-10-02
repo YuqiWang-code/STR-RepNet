@@ -42,7 +42,7 @@ Lightweight Spatial-Temporal Structural Re-parameterization Network for Remote S
 - **PBRU**（Run7 迭代，已按判据 WEAK 归档）：Phase-Basis Reparameterized Upsampling 输出头——部署为单个 `Conv2d(D→C·r²,1)` + `PixelShuffle(r)`（全分辨率、无插值）；训练期叠加 4 个零初始化相位基分支 `{1,u,v,u·v}`（BN γ=β=0），FP64 解析折叠吸收（`--head_mode pixelshuffle --use_pbru 1`，部署 +0 参数/FLOPs vs 纯 PixelShuffle，经 D\*=158 预算搜索与 Run2 部署预算持平）
 - **MPCR-Fine**（Run8 迭代，已按判据 FAIL 停止）：Fine-stage Multi-Partition Channel Reparameterization——`refine.pw` 加两个同参数量零初始化 grouped 1×1 分支（groups=4，连续/交织互补分区），`W_eq = W_core + Σ P⁻¹W̃P` 解析折叠回原 dense PW（`--use_mpcr`，部署 +0 参数/FLOPs，预算机器验证 D\*=160、Δ=0）
 - **BiFTR**（Run9 迭代，最后一次结构搜索，已按判据 FAIL 结束）：Bi-sided Frozen-to-Trainable Transition Reparameterization——包装 `encoder.layers[1].downsample` 的 192→384 stride-2 Conv（frozen stage2→trainable stage3 边界），训练期 `y=(I+Δout)W((I+Δin)x)`（Δ 零初始化 1×1，base 冻结），部署 `W_eq=AWB、b_eq=Ab` 折叠回原单个 Conv（`--use_biftr`，部署 +0 参数/FLOPs，预算 equality audit Δ=0）
-- **PFDR**（Run10 迭代，进行中）：Pre-Fusion Dilated Re-parameterization——`t1` 在 `fuse1` 前过可部署 DW5×5，训练期叠加 `DW3 + DW3(d=2) + DW1` 零初始化 depthwise basis，部署解析折叠为单个 DW5（`--use_pfdr 1 --pfdr_mode plain|rep`；预算经 D\* 宽度搜索回收，预注册 gate D\*≥158）
+- **PFDR**（Run10 迭代，已按判据 FAIL 停止）：Pre-Fusion Dilated Re-parameterization——`t1` 在 `fuse1` 前过可部署 DW5×5，训练期叠加 `DW3 + DW3(d=2) + DW1` 零初始化 depthwise basis（aux BN γ=β=0，aux conv Kaiming），部署解析折叠为单个 DW5（`--use_pfdr 1 --pfdr_mode plain|rep`；D\*=158 预算回收，C0==M1 deploy 精确相等）
 
 - 模型入口：`models/changedetection/models/STRRepNet.py`（`STRRepNet`）
 - 核心文件：`reparam.py`（代数折叠原语）、`tar.py`（二时相 bridge）、`dcr_decoder.py`（多尺度解码器）
@@ -237,7 +237,7 @@ Run2 在 Run1 基础上做了两处改造（部署图/参数/FLOPs 完全不变�
   证据（正文保留最有信息量的负结果）、方法冻结后补 3-seed × 4 数据集正式稳定性。
 - 设计文档：[`docs/temporary/STR-RepNet_Run9_BiFTR_设计与实验方案.md`](docs/temporary/STR-RepNet_Run9_BiFTR_设计与实验方案.md)；`train_scripts/TAR-DCR/Run9/README.md`。
 
-## 实验结果（Run10：PFDR，进行中）
+## 实验结果（Run10：PFDR，已完成 —— M1 FAIL）
 
 - **背景**：目标改为四数据集硬门槛（CDD ≥98 / LEVIR ≥92.5 / WHU ≥95 / SYSU ≥85）；
   LEVIR 差 +1.06、SYSU 差 +1.55 → 按新目标**重开结构搜索**，但只允许与 Run3–Run9
@@ -251,25 +251,39 @@ Run2 在 Run1 基础上做了两处改造（部署图/参数/FLOPs 完全不变�
 - **消融**：A0 = Run2 full_last2（不重跑）；C0 = plain pre-fusion DW5（deploy 拓扑对照）；
   M1 = 多分支训练 / 单 DW5 部署。**C0 与 M1 deploy graph 完全相同**，归因
   Topology=C0−A0、Rep=M1−C0、System=M1−A0。
-- **Phase -1 保留度诊断（已完成，先验降级为探索性）**：冻结 Run2 解码器下，
-  t1 的小/中/大目标 held-out diag-LDA AUROC（0.862/0.880/0.874）**低于**融合后
-  fuse1（0.952/0.969/0.936）——静态证据不支持「融合前细节被稀释」；按 doc §6.2
-  不取消 Run10，但机制先验从较强降为探索性（冻结状态静态观察的固有局限，
-  训练期端到端可重塑 t1，由 C0/M1 裁决）。bins 复现 Run6（small ≤502px / medium ≤868px）。
-  详见 `outputs/diagnostics/Run10_PFDR/phase1_retention/prefusion_retention_profile.json`。
+- **Phase -1 保留度诊断**：冻结 Run2 解码器下，t1 的小/中/大目标 held-out diag-LDA AUROC
+  （0.862/0.880/0.874）**低于**融合后 fuse1（0.952/0.969/0.936）——静态证据不支持
+  「融合前细节被稀释」；按 doc §6.2 先验降级为探索性。bins 复现 Run6（small ≤502px /
+  medium ≤868px）。JSON：`outputs/diagnostics/Run10_PFDR/phase1_retention/`。
 - **预训练门槛（Phase 0，全部通过）**：
   - smoke：C0/M1 main-init 一致 + epoch-0 logits 逐位一致（max_diff=0.0）；aux γ 梯度
     非零 @init + γ nudge 后 aux conv 梯度出现；部署仅剩单个 DW5；argmax=0；C0/M1 部署
     Params/FLOPs 相同；
   - 等价性：T0 嵌入精确 + FP64 多分支代数 2.1e-14（<1e-10）；T1 plain 1.4e-06 / rep
     2.9e-06（<2e-5）+ FP64 代数 ~4e-15；T2 全模型 plain 9.9e-05 / rep 5.8e-05（<2e-4）、
-    argmax=0；历史全套（BOTR/NSCR/PBRU/MPCR/BiFTR）回归全过；
+    argmax=0；历史全套回归全过；
   - **预算搜索 D\*=158**（28.817956M / 12.6028G ≤ 锚点 28.828706M / 12.6062G；
-    D=159 FLOPs 仍超 +0.0065G；C0/M1 deploy 精确相等；D\*≥158 gate 通过，与 Run7 一致）。
-- **判据（LEVIR）**：PASS = M1 F1≥0.9200 & IoU≥0.8520 & Precision≥0.9230 & M1−C0≥+0.15pp
-  & 预算/argmax 合格；TARGET-HIT = F1≥0.9250（项目硬目标）；FAIL = F1<0.9159 或
-  Precision<0.9220 或 M1−C0<+0.05pp 或硬门槛失败。WEAK/FAIL 不 sweep。PASS 才扩
-  SYSU→WHU→CDD。
+    D=159 FLOPs 仍超 +0.0065G；C0/M1 deploy 精确相等；D\*≥158 gate 通过）。
+- **结果（LEVIR，300 epoch，seed 2333）**：
+
+  | exp | F1 | Recall | Precision | IoU | deployP(M) | deployF(G) | argmax | dF1 vs A0 |
+  |---|---|---|---|---|---|---|---|---|
+  | C0_PlainPF_DW5 | 0.9143 | 0.9081 | 0.9206 | 0.8422 | 28.8180 | 12.6028 | 0 | −0.0001 |
+  | M1_PFDR_DW5 | **0.9144** | 0.9011 | 0.9280 | 0.8422 | 28.8180 | 12.6028 | 0 | ±0.0000 |
+
+  - 归因：Topology(C0−A0) = −0.0001（中性）；Rep(M1−C0) = **+0.0001**（rep-not-supported）；
+    System(M1−A0) = ±0.0000。
+  - rep 签名：dRecall = **−0.70pp** / dPrecision = **+0.74pp** ——「置信度锐化」签名
+    **第四次**出现；PFDR 分支确实学到非零结构（γ norm：main 12.08，near3 0.46 /
+    dilated3 0.51 / center1 0.41），但折叠后无净益。
+- **M1/LEVIR = FAIL**（0.9144 < 失败线 0.9159；M1−C0 < +0.05pp）→ 按 doc §8 **停止 PFDR，
+  不 sweep，不扩展 SYSU/WHU/CDD**。硬条件全程合格（预算内、argmax=0、fold ~5e-5）。
+- **跨轮结论（Run3–Run10 八种参数化全部失败）**：additive BN 分支（Edge-Basis/NSCR）、
+  phase basis（PBRU）、channel partition（MPCR）、serial multiplicative（BiFTR）、
+  pre-fusion spatial-support（PFDR）五种参数化家族 + 三种辅助机制（IBAS/BOTR），训练分支
+  均学到非零结构但净效应中性或置信度锐化——按 doc §8-G，下一步应**停止 structural branch
+  搜索**，转向重新审查 **deploy architecture function class / dataset protocol /
+  baseline choice**（见 §8-G 预案）。Run10 是预注册结构搜索的最后一次；后续方向待用户决策。
 - 设计文档：[`docs/temporary/STR-RepNet_Run10_PFDR_设计与实验方案.md`](docs/temporary/STR-RepNet_Run10_PFDR_设计与实验方案.md)；`train_scripts/TAR-DCR/Run10/README.md`。
 
 ## 参考文献
